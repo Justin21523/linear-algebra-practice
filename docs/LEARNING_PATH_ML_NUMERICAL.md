@@ -56,6 +56,7 @@
 ### 要驗哪些性質
 - 投影：`p = A x_hat` 落在 `Col(A)`；殘差 `r=b-p` 與 `Col(A)` 正交：`Aᵀr≈0`。
 - QR：`QᵀQ≈I`、`A≈QR`；以及 `x_hat` 的穩定性比較（QR/SVD 通常優於 normal equation）。
+- 正則化（Ridge / TSVD）：Ridge 驗 `Aᵀr≈λx` 並觀察 `‖x‖` 變小、擾動放大倍率下降；TSVD 驗 `U_kᵀr≈0`（只在保留子空間最優）。
 
 ---
 
@@ -95,4 +96,3 @@
 
 ### 對應單元
 - `07-svd/01-svd-and-pca/`（同時示範「不用 `np.linalg.svd`」與 NumPy 版）
-

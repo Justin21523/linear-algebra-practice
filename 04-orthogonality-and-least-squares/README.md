@@ -24,6 +24,8 @@
 03-least-squares-regression/         最小平方回歸（ML 必學！）
 04-gram-schmidt-process/             Gram-Schmidt 正交化
 05-qr-decomposition/                 QR 分解
+06-least-squares-normal-qr-svd/      解法比較：Normal vs QR vs SVD（病態/共線性）
+07-regularization-ridge-and-truncated-svd/ 正則化：Ridge（Tikhonov）與 TSVD
 ```
 
 ## 學習目標
@@ -68,6 +70,10 @@
 QR 分解：
   A = QR
   最小平方解：Rx̂ = Qᵀb
+
+正則化（Ridge / TSVD）：
+  Ridge：min ‖Ax-b‖² + λ‖x‖²  ⇔  (AᵀA + λI)x = Aᵀb
+  TSVD：x̂_k = V_k Σ_k⁻¹ U_kᵀ b（只保留前 k 個奇異值/方向）
 ```
 
 ## 考試重點
