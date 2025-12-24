@@ -1,0 +1,88 @@
+# Compiled files / 編譯檔案
+*.o
+*.obj
+*.exe
+*.out
+*.class
+*.dll
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+.eggs/
+*.egg-info/
+*.egg
+
+# Java
+*.class
+*.jar
+*.war
+*.ear
+target/
+.gradle/
+build/
+
+# Node.js / JavaScript
+node_modules/
+npm-debug.log
+yarn-error.log
+.npm
+.yarn
+
+# C/C++
+*.gch
+*.pch
+*.d
+Debug/
+Release/
+x64/
+x86/
+
+# C#
+bin/
+obj/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Virtual environments
+.env
+.env.local
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
+
+# Build artifacts
+dist/
+*.log
