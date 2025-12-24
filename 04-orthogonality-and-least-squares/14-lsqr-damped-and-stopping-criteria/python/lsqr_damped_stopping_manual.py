@@ -118,7 +118,7 @@ def lsqr_core(  # EN: Core LSQR solver for min ||A x - b|| on a generic matvec o
     atol: float,  # EN: Absolute tolerance for stopping.
     btol: float,  # EN: Relative tolerance for stopping.
     anorm_est: float,  # EN: Estimated ||A||_2 for mixed stopping tests.
-) -> tuple[np.ndarray, int]:  # EN: Return (x_hat, iters).
+) -> tuple[np.ndarray, int, str]:  # EN: Return (x_hat, iters, stop_reason).
     # EN: This is a lightly adapted LSQR core (Paige–Saunders style) without all internal estimates.  # EN: Explain scope.
     m = b.size  # EN: Number of rows / equations.
     x = np.zeros((n,), dtype=float)  # EN: Start from x0 = 0.
@@ -126,13 +126,13 @@ def lsqr_core(  # EN: Core LSQR solver for min ||A x - b|| on a generic matvec o
     u = b.copy()  # EN: Initialize u = b.
     beta = l2_norm(u)  # EN: beta = ||b||.
     if beta < EPS:  # EN: Trivial b=0 case.
-        return x, 0  # EN: Return x=0 immediately.
+        return x, 0, "b is zero (trivial solution)"  # EN: Return x=0 immediately.
     u = u / beta  # EN: Normalize u.
 
     v = matvec_AT(u)  # EN: v = A^T u.
     alpha = l2_norm(v)  # EN: alpha = ||v||.
     if alpha < EPS:  # EN: Degenerate case A^T u = 0.
-        return x, 0  # EN: Return x=0.
+        return x, 0, "A^T b is zero (degenerate)"  # EN: Return x=0.
     v = v / alpha  # EN: Normalize v.
 
     w = v.copy()  # EN: Initialize w = v.
@@ -169,16 +169,26 @@ def lsqr_core(  # EN: Core LSQR solver for min ||A x - b|| on a generic matvec o
         x = x + (phi / rho) * w  # EN: Update x.
         w = v - (theta / rho) * w  # EN: Update w.
 
-        # EN: Mixed stopping test: ||r|| <= btol*||b|| + atol*||A||*||x|| (heuristic).  # EN: Explain test.
+        # EN: LSQR has cheap internal estimates: rnorm ≈ |phi_bar| and arnorm ≈ alpha*|phi_bar|.  # EN: Explain proxies.
+        rnorm_est = abs(phi_bar)  # EN: Proxy for ||r||_2.
+        arnorm_est = abs(alpha * phi_bar)  # EN: Proxy for ||A^T r||_2 (or augmented normal residual).
+
+        # EN: Mixed stopping test: ||r|| <= btol*||b|| + atol*||A||*||x||.  # EN: Explain the main residual test.
         xnorm = l2_norm(x)  # EN: Compute ||x||.
         rnorm_bound = btol * bnorm + atol * anorm_est * xnorm  # EN: Compute mixed residual bound.
-        if abs(phi_bar) <= rnorm_bound:  # EN: Use phi_bar as proxy for residual norm in LSQR.
-            return x, it  # EN: Return with current iterate.
+        if rnorm_est <= rnorm_bound:  # EN: Stop when residual proxy is below the mixed bound.
+            return x, it, "residual bound satisfied"  # EN: Return with current iterate.
+
+        # EN: Normal residual test: ||A^T r|| <= atol * ||A|| * ||r|| (common LSQR criterion).  # EN: Explain test.
+        if arnorm_est <= atol * anorm_est * max(rnorm_est, EPS):  # EN: Stop when normal residual proxy is small.
+            return x, it, "normal residual bound satisfied"  # EN: Return with current iterate.
 
         if beta == 0.0 and alpha == 0.0:  # EN: Stop if bidiagonalization cannot proceed.
             break  # EN: Exit loop.
 
-    return x, max_iters  # EN: Return best effort after max_iters/breakdown.
+    if max_iters > 0 and it >= max_iters:  # EN: If we exhausted the iteration cap, report that explicitly.
+        return x, max_iters, "max_iters reached"  # EN: Return best effort due to iteration cap.
+    return x, it, "stopped (breakdown)"  # EN: Return best effort due to numerical breakdown.
 
 
 def lsqr_with_damping_and_stopping(  # EN: Solve (possibly damped) least squares with explicit diagnostics and stopping criteria.
@@ -223,7 +233,7 @@ def lsqr_with_damping_and_stopping(  # EN: Solve (possibly damped) least squares
     )  # EN: End norm estimation.
 
     # EN: Run LSQR core on the augmented system to get x_hat.  # EN: Explain solver call.
-    x_hat, iters = lsqr_core(  # EN: Solve min ||A_aug x - b_aug|| using LSQR.
+    x_hat, iters, stop_reason_core = lsqr_core(  # EN: Solve min ||A_aug x - b_aug|| using LSQR.
         matvec_A=matvec_A_aug,  # EN: Provide A_aug matvec.
         matvec_AT=matvec_AT_aug,  # EN: Provide A_aug^T matvec.
         b=b_aug,  # EN: Provide augmented RHS.
@@ -302,14 +312,18 @@ def lsqr_with_damping_and_stopping(  # EN: Solve (possibly damped) least squares
     # EN: Determine a human-readable stop reason based on the mixed stopping conditions.  # EN: Explain.
     bnorm = l2_norm(b)  # EN: ||b|| for bound.
     rnorm_bound = btol * bnorm + atol * anorm_est * xnorm  # EN: Mixed bound.
-    if iters >= max_iters:  # EN: Max-iteration stop.
-        stop_reason = "max_iters reached"  # EN: Record stop reason.
-    elif rnorm_aug <= rnorm_bound:  # EN: Residual small enough.
+    if stop_reason_core == "residual bound satisfied":  # EN: Prefer the core stop reason when it is a standard criterion.
+        stop_reason = stop_reason_core  # EN: Store stop reason.
+    elif stop_reason_core == "normal residual bound satisfied":  # EN: Prefer the core normal-residual reason.
+        stop_reason = stop_reason_core  # EN: Store stop reason.
+    elif stop_reason_core == "max_iters reached":  # EN: Prefer the core max-iter reason.
+        stop_reason = stop_reason_core  # EN: Store stop reason.
+    elif rnorm_aug <= rnorm_bound:  # EN: Otherwise, compute a reason from explicit diagnostics.
         stop_reason = "residual within (btol*||b|| + atol*||A||*||x||) bound"  # EN: Record stop reason.
-    elif arnorm <= atol * anorm_est * max(rnorm_aug, EPS):  # EN: Normal residual small enough.
+    elif arnorm <= atol * anorm_est * max(rnorm_aug, EPS):  # EN: Check explicit normal residual bound.
         stop_reason = "normal residual within atol*||A||*||r|| bound"  # EN: Record stop reason.
-    else:  # EN: Fallback.
-        stop_reason = "stopped (breakdown or internal criterion)"  # EN: Record fallback reason.
+    else:  # EN: Fallback to core message.
+        stop_reason = stop_reason_core  # EN: Record fallback reason.
 
     return LSQRRun(  # EN: Return the full run report.
         x_hat=x_hat,  # EN: Store solution.
@@ -399,4 +413,3 @@ def main() -> None:  # EN: Run two demo cases showing damped LSQR and stopping b
 
 if __name__ == "__main__":  # EN: Standard entrypoint guard.
     main()  # EN: Execute main.
-
