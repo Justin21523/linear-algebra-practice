@@ -58,6 +58,7 @@
 - QR：`QᵀQ≈I`、`A≈QR`；以及 `x_hat` 的穩定性比較（QR/SVD 通常優於 normal equation）。
 - 正則化（Ridge / TSVD）：Ridge 驗 `Aᵀr≈λx` 並觀察 `‖x‖` 變小、擾動放大倍率下降；TSVD 驗 `U_kᵀr≈0`（只在保留子空間最優）。
 - 參數選擇（ML 習慣）：用 hold-out 觀察 train/val 誤差曲線，挑 `λ` 或 `k` 的最佳點，並用重複加噪觀察 bias–variance 變化。
+- 參數選擇（更穩）：用 k-fold CV（平均±標準差）選 `λ/k`，並用簡單曲線（ASCII/表格）把「超參數 vs val 誤差」視覺化。
 
 ---
 
