@@ -27,3 +27,7 @@
 ## 範本
 
 可直接複製 `docs/IMPLEMENTATION_TEMPLATE.md` 來撰寫。
+
+## 學習路徑（ML/數值線代）
+
+如果你想以「機器學習 / 數值線代應用」為主線，請看：`docs/LEARNING_PATH_ML_NUMERICAL.md`（每章列出要改哪些矩陣、要驗哪些性質）。

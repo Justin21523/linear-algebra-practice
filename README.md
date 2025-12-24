@@ -33,9 +33,9 @@
 04-orthogonality-and-least-squares/ 正交性與最小平方 (Orthogonality and Least Squares)
 05-determinants/                  行列式 (Determinants)
 06-eigenvalues-and-eigenvectors/  特徵值與特徵向量 (Eigenvalues and Eigenvectors)
+07-svd/                           奇異值分解 (Singular Value Decomposition)
 
 # 規劃中（尚未加入 repo）
-07-svd/                           奇異值分解 (Singular Value Decomposition)
 08-linear-transformations/        線性變換 (Linear Transformations)
 09-optimization-and-data/         最佳化與資料應用 (Optimization and Data) [進階]
 ```
@@ -73,7 +73,7 @@
 | 最小平方法 | `04-orthogonality-and-least-squares/03-least-squares-regression` |
 | 行列式計算與性質 | `05-determinants` |
 | 特徵值、特徵向量、對角化 | `06-eigenvalues-and-eigenvectors` |
-| 奇異值分解 (SVD) | （規劃中）`07-svd` |
+| 奇異值分解 (SVD) | `07-svd` |
 | 線性變換、相似矩陣 | （規劃中）`08-linear-transformations` |
 
 ## 使用方式
