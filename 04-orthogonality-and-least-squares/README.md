@@ -26,6 +26,7 @@
 05-qr-decomposition/                 QR 分解
 06-least-squares-normal-qr-svd/      解法比較：Normal vs QR vs SVD（病態/共線性）
 07-regularization-ridge-and-truncated-svd/ 正則化：Ridge（Tikhonov）與 TSVD
+08-regularization-model-selection/   參數選擇：用 hold-out 選 λ / k（bias–variance）
 ```
 
 ## 學習目標
