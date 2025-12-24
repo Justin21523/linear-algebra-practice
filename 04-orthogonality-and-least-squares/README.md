@@ -31,6 +31,7 @@
 10-iterative-solvers-for-ridge/      迭代法解 Ridge：GD vs CG（條件數與收斂）
 11-preconditioning-for-ridge/       預條件化：CG vs PCG（Jacobi）
 12-early-stopping-implicit-regularization/ Early Stopping（隱式正則化）：用迭代次數選模型
+13-lsqr-iterative-least-squares/    LSQR：不形成 AᵀA 的最小平方迭代法
 ```
 
 ## 學習目標

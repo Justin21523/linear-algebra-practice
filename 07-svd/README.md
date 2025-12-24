@@ -19,5 +19,5 @@ SVD 的重點不只是「算出來」，而是理解：
 
 ```
 01-svd-and-pca/   SVD 基礎 + 低秩近似 + PCA（以 NumPy 與「不用 np.linalg.svd」的方式對照）
+02-power-iteration-and-lanczos-pca/ 大型 PCA：Power iteration / Lanczos（只求第一主成分，不做完整 SVD）
 ```
-
