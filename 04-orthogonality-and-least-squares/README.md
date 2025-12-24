@@ -30,6 +30,7 @@
 09-regularization-kfold-cross-validation/ 參數選擇（更穩）：k-fold CV + ASCII 曲線
 10-iterative-solvers-for-ridge/      迭代法解 Ridge：GD vs CG（條件數與收斂）
 11-preconditioning-for-ridge/       預條件化：CG vs PCG（Jacobi）
+12-early-stopping-implicit-regularization/ Early Stopping（隱式正則化）：用迭代次數選模型
 ```
 
 ## 學習目標
