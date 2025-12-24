@@ -32,6 +32,7 @@
 11-preconditioning-for-ridge/       預條件化：CG vs PCG（Jacobi）
 12-early-stopping-implicit-regularization/ Early Stopping（隱式正則化）：用迭代次數選模型
 13-lsqr-iterative-least-squares/    LSQR：不形成 AᵀA 的最小平方迭代法
+14-lsqr-damped-and-stopping-criteria/ Damped LSQR（Ridge）+ stopping criteria（更實務）
 ```
 
 ## 學習目標

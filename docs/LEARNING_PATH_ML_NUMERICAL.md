@@ -63,6 +63,7 @@
 - 預條件化（加速）：用 Jacobi 預條件器 `M=diag(AᵀA+λI)` 做 PCG，比較 `||r||` 下降與迭代數（PCG 通常更快）。
 - 隱式正則化（Early stopping）：不加 λ 的 GD 也能用「迭代步數 T」控制泛化，用驗證集挑最佳 T，觀察 train/val RMSE 的 U 形。
 - 大型最小平方（LSQR）：只用 `A v`/`Aᵀ u` 迭代解 `min‖Ax-b‖`，驗 `‖Ax-b‖` 與 `‖Aᵀ(Ax-b)‖`，並與 `lstsq` 對照。
+- 正則化最小平方（Damped LSQR）：把 `min(‖Ax-b‖² + damp²‖x‖²)` 改寫成擴增系統 `[A; damp I]`，並用 `atol/btol` 等 stopping criteria 驗收斂。
 
 ---
 
@@ -100,7 +101,9 @@
 - `UᵀU≈I`、`VᵀV≈I`、重建：`‖A-UΣVᵀ‖_F`。
 - 低秩近似：比較 `‖A-A_k‖_F` 隨 `k` 的變化；PCA 的 explained variance ratio 是否合理（總和≈1）。
 - 大型 PCA（迭代特徵分解）：用 `Cv = Xcᵀ(Xc v)/(n-1)` 做 power iteration/Lanczos，驗 `‖Cv-λv‖` 與方向相似度（cosine similarity）。
+- Top-k PCA（子空間法）：用 block power / deflation / Lanczos(Ritz) 求前 k 個主成分，驗 `‖Cv_i-λ_i v_i‖` 與子空間相似度（principal angles）。
 
 ### 對應單元
 - `07-svd/01-svd-and-pca/`（同時示範「不用 `np.linalg.svd`」與 NumPy 版）
 - `07-svd/02-power-iteration-and-lanczos-pca/`（只求第一主成分：Power iteration / Lanczos）
+- `07-svd/03-top-k-pca-block-power-deflation-lanczos/`（只求前 k 個主成分：block power / deflation / Lanczos）
