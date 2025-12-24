@@ -44,13 +44,35 @@ node cramers_rule.js
 ### Python
 ```bash
 cd 05-determinants/03-cramers-rule/python
-python cramers_rule_manual.py
-python cramers_rule_numpy.py
+python3 cramers_rule_manual.py
+python3 cramers_rule_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### Cramer’s Rule（克萊姆法則）
+
+解 `Ax=b`（A 可逆）時：
+
+- 先算 `det(A)`，必須 `det(A) != 0`
+- 對每個未知數 `x_i`：
+  - 把 `A` 的第 `i` 欄換成 `b` 得到 `A_i`
+  - `x_i = det(A_i) / det(A)`
+
+### 實作與限制
+
+- 需要計算 `n+1` 次行列式（`A` 一次、每個 `A_i` 一次）。
+- 若用 cofactor 展開求 det，複雜度非常高，只適合小矩陣（教學用途）。
+- 實務上解方程更推薦 `solve`/消去法/LU/QR。
+
+### 驗算建議
+
+- 用求出的 `x` 檢查 `Ax ≈ b`。
+- 與 `np.linalg.solve(A, b)` 對照（在 `det(A)` 不太小時應接近）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `05-determinants/03-cramers-rule/python/cramers_rule_manual.py`（僅保留關鍵段落）：

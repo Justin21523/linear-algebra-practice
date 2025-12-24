@@ -13,12 +13,30 @@
 ### Python
 ```bash
 cd 03-vector-spaces-and-subspaces/04-basis-and-dimension/python
-python basis_dimension.py
+python3 basis_dimension.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 基底（Basis）與維度（Dimension）
+
+- **基底**：一組向量，(1) 能生成整個空間（span），(2) 彼此線性獨立。
+- **維度**：任何一組基底向量的個數（所有基底的大小都相同）。
+
+### 典型程式化流程
+
+1. 將向量（或矩陣的 columns）組成矩陣 `A`。
+2. 用 RREF 找主元欄 → 主元欄對應的向量形成一組基底。
+3. 基底數量 = `rank(A)`；若要找零空間維度，則用 `nullity(A) = n - rank(A)`。
+
+### 驗算建議
+
+- 用基底向量重建原向量：確認每個原向量都能寫成基底的線性組合（可用解方程/least squares 驗證）。
+- 用 `rank + nullity = n` 做一致性檢查。
 
 ## 程式碼區段（節錄）
 以下節錄自 `03-vector-spaces-and-subspaces/04-basis-and-dimension/python/basis_dimension.py`（僅保留關鍵段落）：

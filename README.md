@@ -33,10 +33,17 @@
 04-orthogonality-and-least-squares/ 正交性與最小平方 (Orthogonality and Least Squares)
 05-determinants/                  行列式 (Determinants)
 06-eigenvalues-and-eigenvectors/  特徵值與特徵向量 (Eigenvalues and Eigenvectors)
+
+# 規劃中（尚未加入 repo）
 07-svd/                           奇異值分解 (Singular Value Decomposition)
 08-linear-transformations/        線性變換 (Linear Transformations)
 09-optimization-and-data/         最佳化與資料應用 (Optimization and Data) [進階]
 ```
+
+## 文件導覽（必看）
+
+- 單元級的「實作說明（繁體中文）」統一放在 `docs/implementations/<章節>/<單元>/README.md`
+- 撰寫/維護規則請看 `docs/README.md`
 
 ## 每單元結構
 
@@ -66,16 +73,26 @@
 | 最小平方法 | `04-orthogonality-and-least-squares/03-least-squares-regression` |
 | 行列式計算與性質 | `05-determinants` |
 | 特徵值、特徵向量、對角化 | `06-eigenvalues-and-eigenvectors` |
-| 對稱矩陣、正定矩陣 | `06-eigenvalues-and-eigenvectors/03-symmetric-matrices` |
-| 奇異值分解 (SVD) | `07-svd` |
-| 線性變換、相似矩陣 | `08-linear-transformations` |
+| 奇異值分解 (SVD) | （規劃中）`07-svd` |
+| 線性變換、相似矩陣 | （規劃中）`08-linear-transformations` |
 
 ## 使用方式
 
-### Python
+### Python 執行環境與安裝
+
+- Python 版本：建議 `Python 3.12+`（至少 `Python 3.10+`，因為工具腳本使用 `|` 型別語法）
+- 建議使用虛擬環境（venv）：
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+- 注意：`*_numpy.py` 需要 `numpy`；`*_manual.py` 通常不需要額外套件。
+
+### Python（範例）
 ```bash
 cd 06-eigenvalues-and-eigenvectors/02-diagonalization/python
-python diagonalization_numpy.py
+python3 diagonalization_numpy.py
 ```
 
 ### C++（使用 Eigen）

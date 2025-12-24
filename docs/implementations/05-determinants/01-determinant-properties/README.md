@@ -44,13 +44,35 @@ node determinant.js
 ### Python
 ```bash
 cd 05-determinants/01-determinant-properties/python
-python determinant_manual.py
-python determinant_numpy.py
+python3 determinant_manual.py
+python3 determinant_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 行列式的核心直覺
+
+- `det(A)` 可以理解為線性變換對「面積/體積」的縮放倍率（帶方向）。
+  - `|det(A)|`：縮放倍率（scale factor）
+  - `sign(det(A))`：是否翻轉方向（orientation flip）
+
+### 常用性質（用來驗算很有效）
+
+- `det(I) = 1`
+- `det(A^T) = det(A)`
+- `det(AB) = det(A)det(B)`
+- 交換兩列（或兩行）→ 行列式乘上 `-1`
+- 某列乘上常數 `c` → 行列式乘上 `c`
+- 三角矩陣（上/下三角）→ `det(A)` 等於對角線元素乘積
+
+### 實作策略
+
+- 小尺寸（2×2、3×3）用封閉公式最快也最清楚（例如 2×2：`ad - bc`）。
+- NumPy 版本用 `np.linalg.det` 做對照驗證；若差異很小通常是浮點誤差，建議用 `abs(a-b) < tol` 判斷。
 
 ## 程式碼區段（節錄）
 以下節錄自 `05-determinants/01-determinant-properties/python/determinant_manual.py`（僅保留關鍵段落）：

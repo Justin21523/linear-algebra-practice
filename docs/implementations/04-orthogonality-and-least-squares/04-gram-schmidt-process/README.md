@@ -44,13 +44,38 @@ node gram_schmidt.js
 ### Python
 ```bash
 cd 04-orthogonality-and-least-squares/04-gram-schmidt-process/python
-python gram_schmidt_manual.py
-python gram_schmidt_numpy.py
+python3 gram_schmidt_manual.py
+python3 gram_schmidt_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### Gram–Schmidt 的目的
+
+給一組線性獨立向量 `{a1, a2, ..., ak}`，Gram–Schmidt 會產生一組**正交（或正交正規）**向量 `{q1, q2, ..., qk}`，而且 span 不變。
+
+### 演算法（最常見寫法）
+
+對每個 `a_k`：
+
+1. 先把它減掉在前面向量方向上的投影：
+   - `u_k = a_k - Σ_{j<k} proj_{q_j}(a_k)`
+2. 再正規化：
+   - `q_k = u_k / ‖u_k‖`
+
+### 數值注意
+
+- 若向量幾乎相依，`‖u_k‖` 可能很小，會放大誤差或導致除以 0；程式應用容忍度檢查。
+- 實務上常用 Modified Gram–Schmidt 或直接用 Householder（本 repo 以教學清楚為主）。
+
+### 驗算
+
+- 檢查 `q_i · q_j ≈ 0`（i≠j）。
+- 檢查 `‖q_i‖ ≈ 1`（若做了正規化）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `04-orthogonality-and-least-squares/04-gram-schmidt-process/python/gram_schmidt_manual.py`（僅保留關鍵段落）：

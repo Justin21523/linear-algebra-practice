@@ -44,13 +44,47 @@ node least_squares.js
 ### Python
 ```bash
 cd 04-orthogonality-and-least-squares/03-least-squares-regression/python
-python least_squares_manual.py
-python least_squares_numpy.py
+python3 least_squares_manual.py
+python3 least_squares_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 為什麼需要最小平方（Least Squares）？
+
+當 `Ax=b` 無解（常見於超定系統，資料點太多、方程太多）時，我們改求：
+
+`x̂ = argmin_x ‖Ax - b‖^2`
+
+也就是找一個 `Ax̂` 最接近 `b` 的解。
+
+### 正規方程（Normal Equation）
+
+最小平方的必要條件是殘差 `r = b - Ax̂` 與 column space 正交，推得：
+
+`A^T A x̂ = A^T b`
+
+因此 manual 版本通常會：
+
+1. 計算 `A^T A` 與 `A^T b`
+2. 解線性系統得到 `x̂`
+
+### QR 方法（更穩定的做法）
+
+若 `A = QR`（`Q` 正交、`R` 上三角），則：
+
+`‖Ax - b‖ = ‖QRx - b‖ = ‖Rx - Q^T b‖`
+
+因此只要解上三角：`R x̂ = Q^T b`，通常比直接用 `A^T A` 更穩定。
+
+### 驗算重點
+
+- 檢查 `A^T (b - Ax̂) ≈ 0`（殘差對 column space 正交）。
+- 比較不同方法（normal equation vs QR）在數值上是否一致（允許浮點誤差）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `04-orthogonality-and-least-squares/03-least-squares-regression/python/least_squares_manual.py`（僅保留關鍵段落）：

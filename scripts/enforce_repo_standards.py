@@ -18,12 +18,27 @@ from typing import Iterable  # EN: Type helper for iterable return types.
 SOURCE_EXTENSIONS = {".py", ".c", ".cpp", ".java", ".js", ".cs"}  # EN: File extensions treated as source code in this repo.
 SKIP_DIR_NAMES = {".git", "docs"}  # EN: Directories to skip during source scanning to avoid rewriting generated docs.
 GENERATED_MARKER = "EN:"  # EN: Marker used to detect previously generated inline English comments.
+DEFAULT_MIN_EN_COMMENT_COVERAGE = 0.90  # EN: Default minimum EN comment coverage required per source file.
+REQUIRED_DOC_SECTION = "## 詳細說明"  # EN: Required section header for unit implementation docs (Traditional Chinese).
 
 
 @dataclass(frozen=True)  # EN: Declare an immutable record for per-language comment syntax.
 class CommentStyle:  # EN: Hold language-specific comment tokens and behaviors.
     token: str  # EN: The inline comment token (e.g., "#" or "//").
     marker: str  # EN: The unique marker prefix used in generated comments.
+
+
+@dataclass(frozen=True)  # EN: Declare an immutable record for EN-comment coverage metrics.
+class CoverageResult:  # EN: Store coverage statistics for a single source file.
+    total_lines: int  # EN: Count of relevant (non-empty, non-comment, non-docstring) lines.
+    commented_lines: int  # EN: Count of relevant lines containing our EN marker.
+    ratio: float  # EN: commented_lines / total_lines (or 1.0 when total_lines == 0).
+
+
+@dataclass(frozen=True)  # EN: Declare an immutable record for unit-doc verification results.
+class UnitDocReport:  # EN: Store doc verification issues and paths that need updates.
+    issues: list[str]  # EN: Human-readable issues suitable for CI output.
+    touched: list[Path]  # EN: Paths that were updated (write) or would need updates (dry-run).
 
 
 PY_STYLE = CommentStyle(token="#", marker="# EN:")  # EN: Python uses hash comments.
@@ -49,6 +64,12 @@ def main() -> int:  # EN: Provide a CLI entrypoint returning a process exit code
         action="store_true",  # EN: Treat presence of the flag as True.
         help="Annotate source files with inline English comments.",  # EN: Explain which files will be annotated.
     )  # EN: Finish defining the --annotate argument.
+    parser.add_argument(  # EN: Add a numeric threshold for EN comment coverage checks.
+        "--min-en-comment-coverage",  # EN: CLI flag for the minimum required EN comment coverage.
+        type=float,  # EN: Parse the flag value as a float.
+        default=DEFAULT_MIN_EN_COMMENT_COVERAGE,  # EN: Use the repo default unless overridden.
+        help="Minimum required EN comment coverage per file (default: 0.90).",  # EN: Explain the threshold meaning.
+    )  # EN: Finish defining the coverage threshold argument.
     args = parser.parse_args()  # EN: Parse CLI arguments from sys.argv.
 
     repo_root = Path(__file__).resolve().parents[1]  # EN: Derive the repository root from the scripts/ folder.
@@ -56,28 +77,42 @@ def main() -> int:  # EN: Provide a CLI entrypoint returning a process exit code
     annotate_enabled = args.annotate or (not args.docs)  # EN: Default to annotation unless docs-only is requested.
     docs_enabled = args.docs  # EN: Store whether unit doc generation is enabled.
 
-    changed_files: list[Path] = []  # EN: Track which files were modified to report summary information.
+    issues: list[str] = []  # EN: Collect human-readable compliance issues for reporting and CI failures.
+    touched: list[Path] = []  # EN: Collect files that were updated (write) or would be updated (dry-run).
 
-    if annotate_enabled:  # EN: Only annotate source files when enabled.
+    if annotate_enabled:  # EN: Only check/annotate source files when enabled.
         for file_path in iter_source_files(repo_root):  # EN: Walk every source file under the repo root.
-            updated_text = annotate_text(file_path, file_path.read_text(encoding="utf-8"))  # EN: Produce annotated text.
-            if updated_text is None:  # EN: Skip files that do not need updates.
-                continue  # EN: Continue scanning the next file.
-            if args.write:  # EN: Only write when --write is provided.
-                file_path.write_text(updated_text, encoding="utf-8")  # EN: Persist the updated source file.
-            changed_files.append(file_path)  # EN: Record this file as changed (or would-change in dry-run).
+            original_text = file_path.read_text(encoding="utf-8", errors="replace")  # EN: Load file content safely.
+            coverage = measure_en_comment_coverage(path=file_path, text=original_text)  # EN: Compute EN comment coverage ratio.
+            if coverage.total_lines > 0 and coverage.ratio < args.min_en_comment_coverage:  # EN: Enforce minimum coverage threshold.
+                issues.append(  # EN: Record a human-readable issue for CI output.
+                    f"{file_path}: EN comment coverage {coverage.ratio:.0%} < {args.min_en_comment_coverage:.0%}",  # EN: Include ratio details.
+                )  # EN: Finish appending the issue message.
+                if args.write:  # EN: Optionally auto-fix by appending inline EN comments.
+                    updated_text = annotate_text(file_path, original_text)  # EN: Produce annotated text for this file.
+                    if updated_text is not None:  # EN: Only write when we actually generated a change.
+                        file_path.write_text(updated_text, encoding="utf-8")  # EN: Persist the updated source file.
+                        touched.append(file_path)  # EN: Record the file as touched.
+                else:  # EN: In dry-run, report that this file would need changes.
+                    touched.append(file_path)  # EN: Record the file as needing changes.
 
-    if docs_enabled:  # EN: Only generate unit docs when enabled.
-        for doc_path in generate_unit_docs(repo_root=repo_root, write=args.write):  # EN: Create/refresh unit docs and yield paths.
-            changed_files.append(doc_path)  # EN: Record docs that were written (or would be written in dry-run).
+    if docs_enabled:  # EN: Only verify/generate unit docs when enabled.
+        report = verify_unit_docs(repo_root=repo_root, write=args.write)  # EN: Check unit docs existence and required sections.
+        issues.extend(report.issues)  # EN: Merge doc issues into the main issue list.
+        touched.extend(report.touched)  # EN: Merge doc touched paths into the main touched list.
 
-    if changed_files:  # EN: If any changes were made (or would be made), print a short summary.
+    if touched:  # EN: If any changes are needed (or were written), print a short summary.
         mode = "WRITE" if args.write else "DRY-RUN"  # EN: Decide the reporting mode string.
-        print(f"[{mode}] updated {len(changed_files)} files")  # EN: Print the count of touched files.
-    else:  # EN: If nothing changed, tell the user explicitly.
+        print(f"[{mode}] {len(touched)} files need updates")  # EN: Print the count of touched files.
+    else:  # EN: If nothing needs changes, tell the user explicitly.
         print("No changes needed.")  # EN: Print a friendly no-op message.
 
-    return 0  # EN: Return success.
+    if issues and not args.write:  # EN: Fail CI / check runs when issues exist and we did not auto-fix.
+        for msg in issues:  # EN: Print each issue to help contributors fix quickly.
+            print(f"- {msg}")  # EN: Emit bullet-style issue lines for readability.
+        return 1  # EN: Return non-zero to signal failure in CI or pre-commit checks.
+
+    return 0  # EN: Return success when compliant or after auto-fix.
 
 
 def iter_source_files(repo_root: Path) -> Iterable[Path]:  # EN: Yield all source files we want to annotate.
@@ -97,6 +132,83 @@ def comment_style_for_path(path: Path) -> CommentStyle:  # EN: Choose the commen
     if path.suffix == ".py":  # EN: Python uses hash comments.
         return PY_STYLE  # EN: Return Python comment style.
     return CLIKE_STYLE  # EN: Default to C-like style for the remaining languages.
+
+
+def measure_en_comment_coverage(*, path: Path, text: str) -> CoverageResult:  # EN: Measure how many relevant lines include the EN marker.
+    style = comment_style_for_path(path)  # EN: Pick the expected marker token for this file type.
+    lines = text.splitlines()  # EN: Split the file into lines without keeping newline characters.
+
+    total = 0  # EN: Track total relevant lines.
+    commented = 0  # EN: Track relevant lines that already contain the EN marker.
+
+    if style is PY_STYLE:  # EN: Apply Python-specific logic to avoid counting docstrings.
+        in_triple = False  # EN: Track whether we are inside a triple-quoted string block (docstring or literal).
+        triple_delim: str | None = None  # EN: Track which delimiter opened the current triple-quoted block.
+
+        for line in lines:  # EN: Scan each line in the Python file.
+            stripped = line.strip()  # EN: Normalize whitespace for classification.
+            if not stripped:  # EN: Skip blank lines.
+                continue  # EN: Move to the next line.
+
+            if stripped.startswith("#"):  # EN: Exclude pure comment lines from coverage accounting.
+                continue  # EN: Move to the next line.
+
+            code_part = line.split("#", 1)[0]  # EN: Use the pre-comment portion to detect triple quotes more reliably.
+
+            if in_triple:  # EN: When inside a docstring, look for the closing delimiter.
+                if triple_delim and triple_delim in code_part and code_part.count(triple_delim) % 2 == 1:  # EN: Detect close.
+                    in_triple = False  # EN: Exit docstring mode.
+                    triple_delim = None  # EN: Clear delimiter state.
+                continue  # EN: Do not count lines inside triple-quoted blocks toward coverage.
+
+            # EN: Exclude any line that starts or contains an opening triple quote (docstring or multiline literal).
+            if '"""' in code_part or "'''" in code_part:  # EN: Detect any triple-quote delimiter in the code portion.
+                dq_index = code_part.find('"""')  # EN: Find where the double-quote triple begins (or -1).
+                sq_index = code_part.find("'''")  # EN: Find where the single-quote triple begins (or -1).
+                if dq_index != -1 and (sq_index == -1 or dq_index < sq_index):  # EN: Prefer the earliest delimiter.
+                    triple_delim = '"""'  # EN: Track double-quote triple strings.
+                else:  # EN: Otherwise fall back to single-quote triple strings.
+                    triple_delim = "'''"  # EN: Track single-quote triple strings.
+                if code_part.count(triple_delim) % 2 == 1:  # EN: Enter triple mode when delimiter count is odd.
+                    in_triple = True  # EN: Mark that we are now inside a triple-quoted block.
+                continue  # EN: Exclude the delimiter line from coverage accounting.
+
+            total += 1  # EN: Count this as a relevant code line.
+            if style.marker in line:  # EN: Count the line as covered when it has the expected marker.
+                commented += 1  # EN: Increment the covered line count.
+
+        ratio = (commented / total) if total else 1.0  # EN: Compute ratio, treating empty files as fully covered.
+        return CoverageResult(total_lines=total, commented_lines=commented, ratio=ratio)  # EN: Return the computed metrics.
+
+    # EN: C-like languages: skip block comments and comment-only lines.
+    in_block_comment = False  # EN: Track whether we are inside a /* ... */ comment block.
+    for line in lines:  # EN: Scan each line in the file.
+        stripped = line.strip()  # EN: Normalize whitespace for classification.
+        if not stripped:  # EN: Skip blank lines.
+            continue  # EN: Move to the next line.
+
+        if in_block_comment:  # EN: If currently inside a block comment, look for the terminator.
+            if "*/" in stripped:  # EN: Detect the end of the block comment.
+                in_block_comment = False  # EN: Exit block comment mode.
+            continue  # EN: Do not count comment lines toward coverage.
+
+        if stripped.startswith("//"):  # EN: Exclude single-line comment-only lines.
+            continue  # EN: Move to the next line.
+
+        if stripped.startswith("/*"):  # EN: Enter block comment mode for multi-line comments.
+            if "*/" not in stripped:  # EN: Only enter block mode when it does not end on the same line.
+                in_block_comment = True  # EN: Mark that we are inside a block comment.
+            continue  # EN: Exclude the block comment opening line from coverage.
+
+        if stripped.startswith(("*", "*/")):  # EN: Exclude mid-block comment lines that begin with '*'.
+            continue  # EN: Move to the next line.
+
+        total += 1  # EN: Count this as a relevant code line.
+        if style.marker in line:  # EN: Count the line as covered when it has the expected marker.
+            commented += 1  # EN: Increment the covered line count.
+
+    ratio = (commented / total) if total else 1.0  # EN: Compute ratio, treating empty files as fully covered.
+    return CoverageResult(total_lines=total, commented_lines=commented, ratio=ratio)  # EN: Return the computed metrics.
 
 
 def annotate_text(path: Path, text: str) -> str | None:  # EN: Annotate a file’s content; return None if unchanged.
@@ -267,6 +379,71 @@ def generate_clike_comment(stripped: str) -> str:  # EN: Heuristically describe 
     return f"Execute line: {shorten(stripped)}."  # EN: Fallback for anything else (e.g., signatures).
 
 
+def iter_units(*, repo_root: Path) -> Iterable[tuple[Path, Path, Path, list[Path]]]:  # EN: Yield (chapter, unit, unit_readme, source_files).
+    chapters = sorted(  # EN: Gather chapter folders like 01-*/02-*/ etc.
+        [p for p in repo_root.iterdir() if p.is_dir() and re.match(r"^\d\d-", p.name)],  # EN: Filter by "NN-" prefix.
+        key=lambda p: p.name,  # EN: Sort by folder name for stable output.
+    )  # EN: Finish building the chapter list.
+
+    for chapter_dir in chapters:  # EN: Iterate each chapter directory at the repo root.
+        units = sorted(  # EN: Gather unit folders inside the chapter directory.
+            [p for p in chapter_dir.iterdir() if p.is_dir() and re.match(r"^\d\d-", p.name)],  # EN: Filter by "NN-" prefix.
+            key=lambda p: p.name,  # EN: Sort units by name for stable output.
+        )  # EN: Finish building the unit list.
+
+        for unit_dir in units:  # EN: Iterate each unit directory inside this chapter.
+            unit_readme = unit_dir / "README.md"  # EN: Unit-level concept README path.
+            if not unit_readme.exists():  # EN: Skip directories that do not represent a learning unit.
+                continue  # EN: Move to the next candidate directory.
+
+            source_files = sorted(  # EN: Collect all source files under this unit directory.
+                [p for p in unit_dir.rglob("*") if p.is_file() and p.suffix in SOURCE_EXTENSIONS],  # EN: Filter by extensions.
+                key=lambda p: str(p),  # EN: Sort by full relative path for deterministic ordering.
+            )  # EN: Finish collecting source files.
+            if not source_files:  # EN: Skip units with no source code files.
+                continue  # EN: Move to the next unit.
+
+            yield chapter_dir, unit_dir, unit_readme, source_files  # EN: Yield all unit metadata needed for doc checks.
+
+
+def verify_unit_docs(*, repo_root: Path, write: bool) -> UnitDocReport:  # EN: Verify unit docs exist and include required sections.
+    implementations_root = repo_root / "docs" / "implementations"  # EN: Compute the base folder for unit docs.
+    issues: list[str] = []  # EN: Accumulate missing/invalid doc issues.
+    touched: list[Path] = []  # EN: Accumulate doc paths that need updates.
+
+    for chapter_dir, unit_dir, unit_readme, source_files in iter_units(repo_root=repo_root):  # EN: Scan every unit in the repo.
+        doc_path = implementations_root / chapter_dir.name / unit_dir.name / "README.md"  # EN: Expected doc output path.
+
+        if not doc_path.exists():  # EN: Missing unit doc is a failure for CI.
+            issues.append(f"{doc_path}: missing unit implementation doc")  # EN: Record a clear missing-doc message.
+            touched.append(doc_path)  # EN: Mark the doc path as needing an update.
+            if write:  # EN: In write mode, create a skeleton doc to unblock contributors.
+                doc_path.parent.mkdir(parents=True, exist_ok=True)  # EN: Ensure the destination directory exists.
+                doc_text = build_unit_doc(  # EN: Build a baseline Markdown document for this unit.
+                    repo_root=repo_root,  # EN: Provide the repo root for relative paths.
+                    chapter_dir=chapter_dir,  # EN: Provide the chapter directory.
+                    unit_dir=unit_dir,  # EN: Provide the unit directory.
+                    unit_readme=unit_readme,  # EN: Provide the unit README path.
+                    source_files=source_files,  # EN: Provide the list of source files for this unit.
+                )  # EN: Finish building the skeleton doc.
+                doc_path.write_text(doc_text, encoding="utf-8")  # EN: Write the skeleton doc to disk.
+            continue  # EN: Skip further checks for missing docs.
+
+        doc_text = doc_path.read_text(encoding="utf-8", errors="replace")  # EN: Read the existing unit doc content.
+        if REQUIRED_DOC_SECTION not in doc_text:  # EN: Enforce that unit docs include a detailed explanation section.
+            issues.append(f"{doc_path}: missing required section '{REQUIRED_DOC_SECTION}'")  # EN: Record the issue.
+            touched.append(doc_path)  # EN: Mark this doc as needing updates.
+            if write:  # EN: In write mode, append a placeholder section to guide future edits.
+                placeholder = (  # EN: Build a minimal placeholder section that the author should expand.
+                    "\n\n"  # EN: Add spacing before the new section.
+                    f"{REQUIRED_DOC_SECTION}\n\n"  # EN: Add the required section header.
+                    "- TODO：補上此單元的詳細繁中說明（含公式、步驟、檢查方式、常見錯誤）。\n"  # EN: Add a clear TODO item.
+                )  # EN: Finish composing the placeholder.
+                doc_path.write_text(doc_text.rstrip() + placeholder, encoding="utf-8")  # EN: Persist the updated doc.
+
+    return UnitDocReport(issues=issues, touched=touched)  # EN: Return the combined verification report.
+
+
 def generate_unit_docs(*, repo_root: Path, write: bool) -> Iterable[Path]:  # EN: Generate per-unit docs and yield doc file paths.
     implementations_root = repo_root / "docs" / "implementations"  # EN: Compute the base folder for generated unit docs.
     chapters = sorted(  # EN: Gather chapter folders like 01-*/02-*/ etc.
@@ -340,6 +517,9 @@ def build_unit_doc(  # EN: Build a Traditional-Chinese per-unit implementation d
     lines.append("\n## 核心做法（重點）\n")  # EN: Start the “core approach” section.
     lines.append("- 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。\n")  # EN: Describe the typical structure of implementations.
     lines.append("- 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。\n")  # EN: Mention the pedagogical approach used throughout the repo.
+
+    lines.append(f"\n{REQUIRED_DOC_SECTION}\n")  # EN: Add the required “detailed explanation” section header.
+    lines.append("- TODO：補上此單元的詳細繁中說明（含公式、步驟、檢查方式、常見錯誤）。\n")  # EN: Provide a placeholder to guide future manual expansion.
 
     snippet = extract_code_snippet(repo_root=repo_root, source_files=source_files)  # EN: Choose and extract a representative code snippet.
     if snippet:  # EN: Only add the snippet section when we successfully extracted something.
@@ -431,8 +611,8 @@ def read_header(*, file_path: Path, max_lines: int) -> str:  # EN: Read the firs
 def fallback_command_for_file(path: Path) -> str:  # EN: Provide a simple default run command when none is found in headers.
     name = path.name  # EN: Capture the file name for command construction.
     stem = path.stem  # EN: Capture the base name without extension.
-    if path.suffix == ".py":  # EN: Python files run directly with python.
-        return f"python {name}"  # EN: Return a python run command.
+    if path.suffix == ".py":  # EN: Python files run directly with python3 in most Linux environments.
+        return f"python3 {name}"  # EN: Return a python3 run command.
     if path.suffix == ".js":  # EN: JavaScript files run with node.
         return f"node {name}"  # EN: Return a node run command.
     if path.suffix == ".java":  # EN: Java files typically compile then run the class matching the filename.

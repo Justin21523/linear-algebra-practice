@@ -13,12 +13,49 @@
 ### Python
 ```bash
 cd 03-vector-spaces-and-subspaces/05-four-fundamental-subspaces/python
-python four_subspaces.py
+python3 four_subspaces.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### Strang 的「四大基本子空間」
+
+對一個 `m×n` 矩陣 `A`，有四個最重要的子空間：
+
+- `C(A)`：Column space（在 `ℝ^m`）
+- `N(A)`：Null space（在 `ℝ^n`）
+- `C(A^T)`：Row space（在 `ℝ^n`）
+- `N(A^T)`：Left null space（在 `ℝ^m`）
+
+它們之間最關鍵的關係是「正交補」：
+
+- `N(A)` 與 Row space 互為正交補
+- `N(A^T)` 與 Column space 互為正交補
+
+### 維度關係（一定要會）
+
+若 `rank(A) = r`：
+
+- `dim C(A) = r`
+- `dim N(A) = n - r`
+- `dim C(A^T) = r`
+- `dim N(A^T) = m - r`
+
+### 程式實作如何落地
+
+- 先用 RREF 找主元欄與 rank。
+- 由主元欄取得 `C(A)` 的基底；由 RREF 的非零列取得 Row space 的基底。
+- 用「自由變數」方法建立 `N(A)` 的基底；`N(A^T)` 則可對 `A^T` 重複同樣步驟。
+
+### 驗算建議
+
+- 對 `x ∈ N(A)`，檢查 `A @ x ≈ 0`。
+- 對 `y ∈ N(A^T)`，檢查 `A.T @ y ≈ 0`。
+- 用內積檢查正交性（例如 Row space 的任一向量應與 `N(A)` 的基底向量近似正交）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `03-vector-spaces-and-subspaces/05-four-fundamental-subspaces/python/four_subspaces.py`（僅保留關鍵段落）：

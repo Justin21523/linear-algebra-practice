@@ -1,0 +1,31 @@
+# EN: Basic CI checks for repository standards and Python syntax.
+
+name: CI  # EN: Workflow name shown in GitHub Actions UI.
+
+on:  # EN: Define which events trigger this workflow.
+  push:  # EN: Run CI on every push.
+  pull_request:  # EN: Run CI on every PR.
+
+jobs:  # EN: Define workflow jobs.
+  standards:  # EN: Single job to keep CI simple and fast.
+    runs-on: ubuntu-latest  # EN: Use GitHub-hosted Ubuntu runner.
+
+    steps:  # EN: Define job steps.
+      - name: Checkout  # EN: Fetch repository contents.
+        uses: actions/checkout@v4  # EN: Official checkout action.
+
+      - name: Set up Python  # EN: Install and configure Python for the job.
+        uses: actions/setup-python@v5  # EN: Official Python setup action.
+        with:  # EN: Provide action inputs.
+          python-version: "3.12"  # EN: Use Python 3.12+ (required by scripts/enforce_repo_standards.py typing).
+
+      - name: Python Syntax Check (py_compile)  # EN: Ensure Python files parse after comment enforcement.
+        shell: bash  # EN: Use bash for portable find command usage.
+        run: |  # EN: Multi-line shell script.
+          python3 -m py_compile $(find . -type f -name "*.py" -not -path "./.git/*" -not -path "./docs/*")  # EN: Compile-check all repo Python sources.
+
+      - name: Repository Standards (dry-run)  # EN: Verify docs + EN comment coverage without writing files.
+        shell: bash  # EN: Use bash for consistency.
+        run: |  # EN: Multi-line shell script.
+          python3 scripts/enforce_repo_standards.py --docs --annotate  # EN: Fail CI if docs/comments are missing (dry-run mode).
+

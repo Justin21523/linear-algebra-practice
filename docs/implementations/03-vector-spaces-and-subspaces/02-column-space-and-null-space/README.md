@@ -13,12 +13,30 @@
 ### Python
 ```bash
 cd 03-vector-spaces-and-subspaces/02-column-space-and-null-space/python
-python column_null_space.py
+python3 column_null_space.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 兩個核心子空間
+
+- **行空間/列空間（Column Space）**：`C(A) = {Ax | x ∈ ℝ^n}`，也就是 `A` 的所有 column 的 span。
+- **零空間（Null Space）**：`N(A) = {x | Ax = 0}`，描述齊次方程組的所有解。
+
+### 實作流程（RREF 是關鍵）
+
+1. 先把 `A` 做成 RREF（Reduced Row Echelon Form），同時找出 **主元欄（pivot columns）**。
+2. **Column space 的基底**：取原矩陣 `A` 中「主元欄」對應的 column（注意是原矩陣，不是 RREF）。
+3. **Null space 的基底**：解 `Ax=0`，把非主元欄視為自由變數（free variables），一次設定一個自由變數為 1 其餘為 0，求出一組「特解」，這些特解就是零空間基底。
+
+### 驗算與檢查點
+
+- 對每個零空間基底向量 `x`，檢查 `A @ x ≈ 0`。
+- 檢查秩-零度定理（Rank–Nullity）：`rank(A) + nullity(A) = n`（n 是欄數）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `03-vector-spaces-and-subspaces/02-column-space-and-null-space/python/column_null_space.py`（僅保留關鍵段落）：

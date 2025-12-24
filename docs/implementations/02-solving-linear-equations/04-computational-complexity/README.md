@@ -13,12 +13,32 @@
 ### Python
 ```bash
 cd 02-solving-linear-equations/04-computational-complexity/python
-python complexity_demo.py
+python3 complexity_demo.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 這個單元想建立的直覺
+
+- 很多線代演算法的時間複雜度不是「看起來」那麼直觀，尤其是矩陣相關運算常見 `O(n^3)`。
+- 當 `n` 變成 2 倍時，`O(n^3)` 可能變成 8 倍時間，這就是為什麼大矩陣運算要特別在意演算法與常數因子。
+
+### 常見複雜度（重點記）
+
+- 矩陣乘法（最基本三層迴圈）：`O(n^3)`
+- 高斯消去法：`O(n^3)`
+- 前代/回代（三角矩陣解）：`O(n^2)`
+
+### 實作上通常怎麼做
+
+- 以不同 `n` 產生測資，量測耗時，觀察成長趨勢。
+- 需要注意：
+  - 暖機（warm-up）與多次取平均
+  - 不同語言/不同硬體會影響「常數因子」，但不影響大 O 的趨勢
 
 ## 程式碼區段（節錄）
 以下節錄自 `02-solving-linear-equations/04-computational-complexity/python/complexity_demo.py`（僅保留關鍵段落）：

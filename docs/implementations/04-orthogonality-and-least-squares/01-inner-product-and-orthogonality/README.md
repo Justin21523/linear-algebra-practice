@@ -44,13 +44,41 @@ node inner_product.js
 ### Python
 ```bash
 cd 04-orthogonality-and-least-squares/01-inner-product-and-orthogonality/python
-python inner_product_manual.py
-python inner_product_numpy.py
+python3 inner_product_manual.py
+python3 inner_product_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 內積、範數、夾角
+
+- 內積：`x·y = Σ x_i y_i`（把兩向量的對應分量相乘後加總）。
+- 範數（L2）：`‖x‖ = sqrt(x·x)`。
+- 夾角：`cos(θ) = (x·y)/(‖x‖‖y‖)`，因此 `θ = arccos(cos(θ))`。
+
+### 正交性（Orthogonality）
+
+- `x ⟂ y` 的判斷條件：`x·y = 0`。
+- 實作上用容忍度 `EPSILON` 判斷 `abs(x·y) < EPSILON`，避免浮點誤差。
+
+### 正交矩陣（Orthogonal Matrix）
+
+若 `Q` 是正交矩陣，應滿足：
+
+- `Q^T Q = I`
+- `Q^{-1} = Q^T`
+- 會保持長度：`‖Qx‖ = ‖x‖`
+
+因此程式通常會先做轉置、再做矩陣乘法，最後檢查結果是否接近單位矩陣（同樣用容忍度）。
+
+### Manual vs NumPy
+
+- Manual 版本把「內積/範數/夾角」展成迴圈與公式，最適合用來讀懂線代的幾何意義。
+- NumPy 版本則用 `np.dot`、`np.linalg.norm` 等 API，重點在「把數學寫法直接翻成程式」。
 
 ## 程式碼區段（節錄）
 以下節錄自 `04-orthogonality-and-least-squares/01-inner-product-and-orthogonality/python/inner_product_manual.py`（僅保留關鍵段落）：

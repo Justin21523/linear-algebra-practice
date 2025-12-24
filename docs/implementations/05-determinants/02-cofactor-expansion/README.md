@@ -44,13 +44,33 @@ node cofactor.js
 ### Python
 ```bash
 cd 05-determinants/02-cofactor-expansion/python
-python cofactor_manual.py
-python cofactor_numpy.py
+python3 cofactor_manual.py
+python3 cofactor_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### Cofactor（代數餘子式）展開
+
+對 `n×n` 矩陣 `A`，沿著第 `i` 列展開：
+
+`det(A) = Σ_j a_{ij} C_{ij}`  
+其中 `C_{ij} = (-1)^{i+j} det(M_{ij})`，`M_{ij}` 是刪掉第 i 列第 j 行後的 minor。
+
+### 實作重點
+
+- **遞迴（recursion）**：`det(n×n)` 會呼叫 `det((n-1)×(n-1))`，直到 2×2 或 1×1 為 base case。
+- **時間複雜度很高**：cofactor 展開接近 `O(n!)`，適合教學與小矩陣，不適合大矩陣。
+- **選擇 0 多的列/行展開**：如果某列很多 0，可以大幅減少計算量（本 repo 以概念清楚為主）。
+
+### 驗算建議
+
+- 與 `np.linalg.det` 對照（允許浮點誤差）。
+- 對同一矩陣沿不同列/行展開，結果應一致。
 
 ## 程式碼區段（節錄）
 以下節錄自 `05-determinants/02-cofactor-expansion/python/cofactor_manual.py`（僅保留關鍵段落）：

@@ -44,13 +44,35 @@ node projection.js
 ### Python
 ```bash
 cd 04-orthogonality-and-least-squares/02-projections/python
-python projection_manual.py
-python projection_numpy.py
+python3 projection_manual.py
+python3 projection_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 投影的幾何直覺
+
+投影（projection）是在找「離某個子空間最近的點」。最常見的兩種：
+
+- 投影到向量 `a` 的方向（直線）：`proj_a(b) = (a·b / a·a) a`
+- 投影到由 `A` 的 columns 張成的子空間：`proj(b) = P b`，其中 `P = A(A^T A)^{-1}A^T`
+
+### 實作重點
+
+1. **分母不可為 0**：`a·a` 代表 `‖a‖^2`，若 `a` 是零向量，投影沒有定義。
+2. **投影矩陣性質**（很好用的驗算點）：
+   - `P^2 = P`（冪等 idempotent）
+   - `P^T = P`（對稱 symmetric）
+3. **誤差向量**：`e = b - proj(b)` 應與子空間正交（例如與 `a` 正交，或與 `A` 的 column space 正交）。
+
+### Manual vs NumPy
+
+- Manual 版本會把「內積、比例係數、向量乘法」拆清楚。
+- NumPy 版本通常直接用矩陣寫法 `P @ b`，更貼近課本推導。
 
 ## 程式碼區段（節錄）
 以下節錄自 `04-orthogonality-and-least-squares/02-projections/python/projection_manual.py`（僅保留關鍵段落）：

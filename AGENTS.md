@@ -13,9 +13,14 @@ This repo is a collection of standalone examples (no single global build). Run c
 - Python:
   ```bash
   cd 04-orthogonality-and-least-squares/02-projections/python
-  python projection_manual.py
+  python3 projection_manual.py
   ```
-  NumPy variants require `numpy` installed.
+  NumPy variants require `numpy` installed (see `requirements.txt`).
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python3 -m pip install -r requirements.txt
+  ```
 - C / C++ (see each file header for exact flags):
   ```bash
   gcc -std=c99 -O2 inner_product.c -o inner_product -lm && ./inner_product
@@ -33,13 +38,14 @@ This repo is a collection of standalone examples (no single global build). Run c
 - Indentation: 4 spaces (match existing files). Keep bilingual explanations (中文 + English terms) and the “what this program demonstrates” header style.
 - Comments: for new/updated source files, keep detailed English comments on most lines (aim for >90% line coverage).
 - Naming: preserve `NN-topic-name/` directories and existing file patterns (e.g., `*_manual.*`, `*_numpy.py`, `snake_case` in Python, `CamelCase` in Java/C#).
-- Docs: for every new/changed unit, add a matching Traditional-Chinese explanation doc under `docs/implementations/<chapter>/<unit>/README.md` (see `docs/README.md`).
+- Docs: for every new/changed unit, add `docs/implementations/<chapter>/<unit>/README.md` and include a `## 詳細說明` section (see `docs/README.md`).
 - Keep examples self-contained and avoid adding heavy dependencies; if you add one, document it in the closest `README.md`.
 
 ## Testing Guidelines
 
 - There is no centralized test runner today. Validate changes by running the affected script(s) and checking output against the unit `README.md`.
 - When a manual and library-backed version both exist, they should produce equivalent results (allowing for small floating-point tolerances).
+- Repo standards check (docs + EN comment coverage): `python3 scripts/enforce_repo_standards.py --docs --annotate`
 
 ## Commit & Pull Request Guidelines
 

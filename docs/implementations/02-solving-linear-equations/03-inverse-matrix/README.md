@@ -14,13 +14,38 @@
 ### Python
 ```bash
 cd 02-solving-linear-equations/03-inverse-matrix/python
-python inverse_matrix_manual.py
-python inverse_matrix_numpy.py
+python3 inverse_matrix_manual.py
+python3 inverse_matrix_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 反矩陣的意義
+
+- `A^{-1}` 定義為滿足 `A A^{-1} = I` 的矩陣（只有當 `A` 可逆時存在）。
+- 可逆的直覺：`Ax=b` 對任意 `b` 都有唯一解；等價條件包含 `det(A) != 0`、`rank(A) = n` 等。
+
+### Manual 版本：Gauss–Jordan 求反矩陣
+
+1. 把 `A` 與單位矩陣拼成增廣矩陣：`[A | I]`。
+2. 對左半邊做列運算把它化成 `I`（RREF 的概念）。
+3. 當左半邊變 `I` 時，右半邊就變成 `A^{-1}`。
+
+### NumPy 版本：API 與數值觀念
+
+- 用 `np.linalg.inv(A)` 可以直接求 `A^{-1}`，但**解方程組通常建議用** `np.linalg.solve(A, b)`：
+  - 更快（少一次矩陣乘法）
+  - 數值更穩定
+- 反矩陣常見的風險是條件數（condition number）很大時誤差被放大。
+
+### 驗算建議
+
+- 檢查 `A @ A_inv` 是否接近 `I`（例如誤差容忍 `1e-10`）。
+- 把 `A_inv` 代回 `Ax=b`：`x = A_inv @ b` 是否能得到近似解（但仍建議以 `solve` 為主）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `02-solving-linear-equations/03-inverse-matrix/python/inverse_matrix_manual.py`（僅保留關鍵段落）：

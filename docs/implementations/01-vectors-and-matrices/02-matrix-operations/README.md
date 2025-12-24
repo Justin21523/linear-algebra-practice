@@ -14,13 +14,38 @@
 ### Python
 ```bash
 cd 01-vectors-and-matrices/02-matrix-operations/python
-python matrix_operations_manual.py
-python matrix_operations_numpy.py
+python3 matrix_operations_manual.py
+python3 matrix_operations_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 矩陣資料結構（Manual）
+
+- 以 `List[List[float]]` 表示矩陣 `A`：外層是 row，內層是 column。
+- `get_shape(A)` 回傳 `(rows, cols)`，是所有維度相容性檢查的基礎（特別是加減法與轉置）。
+
+### 基本運算與檢查點
+
+- 加法/減法：同型矩陣逐元素相加/相減；若 `rows/cols` 不一致應直接報錯。
+- 純量乘法：逐元素乘上常數；可用 list comprehension 寫得很直觀。
+- 轉置：把 `A[i][j]` 變成 `A_T[j][i]`；轉置後形狀從 `(m×n)` 變成 `(n×m)`。
+
+### NumPy 版本重點
+
+- 用 `np.array` 表示矩陣，形狀由 `A.shape` 決定，運算通常更直接：
+  - 轉置：`A.T`
+  - 逐元素加減/乘法：`A + B`、`A - B`、`c * A`
+- NumPy 的維度錯誤通常會直接丟例外（或 broadcasting），因此建議仍保留「顯式檢查」的觀念。
+
+### 常見錯誤
+
+- **不規則矩陣（ragged array）**：每列長度不同會讓運算失去意義；manual 版本可在輸入時檢查。
+- **把逐元素乘法當成矩陣乘法**：`A * B` 在 NumPy 是逐元素；矩陣乘法要用 `A @ B`（本單元先不處理矩陣乘法）。
 
 ## 程式碼區段（節錄）
 以下節錄自 `01-vectors-and-matrices/02-matrix-operations/python/matrix_operations_manual.py`（僅保留關鍵段落）：

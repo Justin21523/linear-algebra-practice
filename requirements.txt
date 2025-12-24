@@ -1,0 +1,3 @@
+# EN: Minimal Python dependencies for NumPy-based implementations in this repository.
+numpy>=1.26
+

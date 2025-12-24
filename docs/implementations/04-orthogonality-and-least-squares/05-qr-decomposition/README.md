@@ -44,13 +44,43 @@ node qr_decomposition.js
 ### Python
 ```bash
 cd 04-orthogonality-and-least-squares/05-qr-decomposition/python
-python qr_decomposition_manual.py
-python qr_decomposition_numpy.py
+python3 qr_decomposition_manual.py
+python3 qr_decomposition_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### QR 分解是什麼？
+
+把矩陣 `A` 分解成：
+
+- `A = QR`
+- `Q`：正交矩陣（columns 兩兩正交且為單位向量）
+- `R`：上三角矩陣
+
+### 常見用途：解最小平方
+
+若 `Ax≈b`，且 `A=QR`，則：
+
+`Rx = Q^T b`
+
+因為 `R` 是上三角，可以用回代快速求解。
+
+### 實作重點
+
+- Manual 版本通常用 Gram–Schmidt 先建出 `Q`，再算 `R = Q^T A`。
+- 驗算：
+  - `Q^T Q ≈ I`
+  - `Q @ R ≈ A`
+
+### 常見錯誤
+
+- 忘記 `Q` 的 columns 必須是正交正規（orthonormal），否則 `R = Q^T A` 會不成立。
+- 直接用 `A^T A` 做最小平方在病態矩陣上會變差；QR 通常更穩定。
 
 ## 程式碼區段（節錄）
 以下節錄自 `04-orthogonality-and-least-squares/05-qr-decomposition/python/qr_decomposition_manual.py`（僅保留關鍵段落）：

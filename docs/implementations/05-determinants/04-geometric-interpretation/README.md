@@ -44,13 +44,30 @@ node geometric.js
 ### Python
 ```bash
 cd 05-determinants/04-geometric-interpretation/python
-python geometric_manual.py
-python geometric_numpy.py
+python3 geometric_manual.py
+python3 geometric_numpy.py
 ```
 
 ## 核心做法（重點）
 - 依照單元 `README.md` 的公式/定義，將步驟拆成可讀的函數（如向量加法、矩陣乘法、轉置等）。
 - 以小維度範例（2D/3D 或 2×2/3×3）輸出中間結果，方便驗算與理解。
+
+## 詳細說明
+
+### 幾何意義（2D/3D 最直觀）
+
+- 2D：`det([a b])`（把 `a,b` 當成 columns）等於平行四邊形面積（帶方向）。
+- 3D：`|det(A)|` 等於由三個向量張成的平行六面體體積。
+
+### 符號（sign）代表什麼？
+
+- `det(A) > 0`：保持方向（orientation preserved）
+- `det(A) < 0`：翻轉方向（orientation reversed），例如鏡射（reflection）
+
+### 程式上如何驗算
+
+- 用小向量例子計算 det，並用圖形/幾何公式（如 2D 的叉積大小、3D 的 triple product）對照。
+- 再用 NumPy 的 det 做第二次對照，確認實作無誤。
 
 ## 程式碼區段（節錄）
 以下節錄自 `05-determinants/04-geometric-interpretation/python/geometric_manual.py`（僅保留關鍵段落）：
