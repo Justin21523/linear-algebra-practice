@@ -29,6 +29,7 @@
 08-regularization-model-selection/   參數選擇：用 hold-out 選 λ / k（bias–variance）
 09-regularization-kfold-cross-validation/ 參數選擇（更穩）：k-fold CV + ASCII 曲線
 10-iterative-solvers-for-ridge/      迭代法解 Ridge：GD vs CG（條件數與收斂）
+11-preconditioning-for-ridge/       預條件化：CG vs PCG（Jacobi）
 ```
 
 ## 學習目標
