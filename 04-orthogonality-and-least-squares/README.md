@@ -33,6 +33,8 @@
 12-early-stopping-implicit-regularization/ Early Stopping（隱式正則化）：用迭代次數選模型
 13-lsqr-iterative-least-squares/    LSQR：不形成 AᵀA 的最小平方迭代法
 14-lsqr-damped-and-stopping-criteria/ Damped LSQR（Ridge）+ stopping criteria（更實務）
+15-lsqr-lsmr-preconditioning/      LSQR/LSMR 類方法的預條件化：column scaling（右預條件）
+16-damped-lsqr-damp-selection-cv/  用 k-fold CV 選 damp（Ridge λ=damp²）：更貼近 ML 超參數選擇
 ```
 
 ## 學習目標
