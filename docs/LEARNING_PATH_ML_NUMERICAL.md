@@ -68,6 +68,7 @@
 - 超參數選擇（CV 選 damp）：對候選 `damp` 做 k-fold CV（mean±std），用 validation RMSE 的 U-shape 挑最佳 `damp`（等價 Ridge 的 `λ=damp²`）。
 - LSMR：可視為在 normal equations 上做 MINRES（但不形成 `AᵀA`），用 `‖Aᵀr‖` 作為核心收斂指標，並與 LSQR 比較迭代數/收斂行為。
 - 進階預條件化（Randomized QR）：用 oversampled sketch `SA` 做 QR 取 `R` 當右預條件器（`x=R⁻¹y`），常能大幅降低 LSMR/LSQR 的迭代數。
+- Damped LSMR（Ridge）+ stopping + CV：把 LSMR 套到 `(AᵀA+damp²I)x=Aᵀb`，用 `‖Aᵀ(Ax-b)+damp²x‖` 做收斂驗收，並用 k-fold CV 選 `damp`。
 
 ---
 
