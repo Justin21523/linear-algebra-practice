@@ -6,6 +6,7 @@
 - 單元概念：`04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/README.md`
 - 實作檔案：
   - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/lsmr_damped_sparse_matrix_free_numpy.py`
+  - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/lsmr_damped_sparse_operator_only_numpy.py`
 - 文件路徑：`docs/implementations/04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/README.md`
 
 ## 目標與背景
@@ -24,6 +25,13 @@
 ```bash
 cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
 python3 lsmr_damped_sparse_matrix_free_numpy.py
+```
+
+或執行「真正 operator-only（不存 CSR）」版本：
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_operator_only_numpy.py
 ```
 
 ## 核心做法（重點步驟）
@@ -60,6 +68,26 @@ CSR（Compressed Sparse Row）用三個陣列描述稀疏矩陣：
 
 - `matvec_A(x) = A x`
 - `matvec_AT(y) = Aᵀ y`
+
+### 進一步：operator-only（A 不常駐記憶體）
+
+上一版（CSR）已經做到「迭代法只用 matvec / rmatvec，不形成 `AᵀA`」，但 `A` 本身仍然以 CSR 三個陣列常駐記憶體（`data/indices/indptr`）。
+
+這次的 operator-only 版本再往前一步：**A 也不存**。它模擬真實推薦系統/大規模回歸常見的情境：
+
+- 你的特徵可能是 on-the-fly 產生（feature hashing / 稀疏 one-hot 組合 / log 特徵）
+- 訓練時你只需要「給定 row_id 就能算出該 row 的 sparse feature 列表」
+- 於是 `A@x` 與 `Aᵀ@y` 都可以靠「掃過 row_id、即時生成 sparse row」完成
+
+本單元用「deterministic hashing」把每個 row 的 `(col,value)` 由 `(row_id, k, seed)` 決定，確保：
+
+- 你不用把所有 nonzeros 存起來
+- 但每次 matvec/rmatvec 都會生成同一個 A（可重現）
+
+代價是：
+
+- 你用時間換記憶體：每次 matvec/rmatvec 都要重新生成 row 的非零結構
+- 這更貼近「資料量超大、但單筆 row 很稀疏」的 pipeline（也更貼近 matrix-free 的精神）
 
 ### Ridge 的驗收量（為什麼看 `‖Aᵀr + damp²x‖`）
 
@@ -182,6 +210,16 @@ for each row i:
 subset_tr = make_row_subset(A_full, train_idx)
 y_tr = subset_tr @ x
 z = subset_tr.T @ y_tr
+```
+
+> operator-only 的 row generation（概念上：給 row_id 就能產生 sparse row，不需要存 CSR）。
+
+```text
+for k in 0..nnz_per_row-1:
+  h   = hash(seed, row_id, k)
+  col = h % n
+  val = signed_value(h)
+  accumulate (col, val)
 ```
 
 > warm-start 的等價 RHS（解增量 `delta`，最後合成 `x = x0 + delta`）。

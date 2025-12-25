@@ -14,7 +14,8 @@
 
 ```
 python/
-└── lsmr_damped_sparse_matrix_free_numpy.py   # CSR matvec + damped LSMR (teaching) + (none/col/rand-QR) + k-fold CV + curve cost + warm-start
+├── lsmr_damped_sparse_matrix_free_numpy.py         # CSR matvec + damped LSMR (teaching) + (none/col/rand-QR) + k-fold CV + curve cost + warm-start
+└── lsmr_damped_sparse_operator_only_numpy.py       # Operator-only sparse A (no CSR stored) + same CV/cost pipeline (more "true matrix-free")
 ```
 
 ## 如何執行
@@ -24,6 +25,13 @@ python/
 ```bash
 cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
 python3 lsmr_damped_sparse_matrix_free_numpy.py
+```
+
+或改跑「不保存 A（不存 CSR）」的 operator-only 版本：
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_operator_only_numpy.py
 ```
 
 ## 你應該會看到什麼？
