@@ -29,7 +29,8 @@ np.set_printoptions(precision=PRINT_PRECISION, suppress=True)  # EN: Configure N
 
 
 Matvec = Callable[[np.ndarray], np.ndarray]  # EN: Alias for a matrix-vector product function.
-PrecondKind = Literal["none", "col"]  # EN: Preconditioners supported in this sparse unit.
+PrecondKind = Literal["none", "col", "randqr"]  # EN: Preconditioners supported in this sparse unit.
+RandQRPolicy = Literal["rebuild", "shared_sketch", "fixed_R"]  # EN: Policies for building/reusing sparse rand-QR preconditioners along a damp sweep.
 
 
 @dataclass(frozen=True)  # EN: Immutable representation of a sparse matrix in CSR format.
@@ -38,6 +39,15 @@ class CSRMatrix:  # EN: Store CSR arrays needed for matvec and transpose-matvec.
     indices: np.ndarray  # EN: Column indices for each nonzero (length nnz).
     indptr: np.ndarray  # EN: Row pointer array (length m+1).
     shape: tuple[int, int]  # EN: Matrix shape (m, n).
+
+
+@dataclass(frozen=True)  # EN: Immutable container for a reusable CountSketch of the augmented matrix [A; damp I].
+class CountSketchAug:  # EN: Store SA_top plus the identity-row hashing so SA_aug(damp) can be formed cheaply.
+    SA_top: np.ndarray  # EN: Dense sketch of the data block, SA_top = S_top A (shape s×n).
+    h_bottom: np.ndarray  # EN: Hash bucket for each identity row (length n).
+    sign_bottom: np.ndarray  # EN: Random sign for each identity row (length n).
+    scale: float  # EN: Sketch scaling factor (typically 1/sqrt(s)).
+    s: int  # EN: Sketch row count.
 
 
 @dataclass(frozen=True)  # EN: Immutable record for one solver run.
@@ -54,6 +64,25 @@ class SolveReport:  # EN: Store diagnostics and timing for one (damp, precond) r
     x_hat: np.ndarray  # EN: Estimated solution vector (stored for warm-start paths).
 
 
+@dataclass(frozen=True)  # EN: Immutable record for one CV point (one damp value).
+class CVPoint:  # EN: Store mean/std metrics across folds for one damp.
+    key: str  # EN: Display label (e.g., "d=1e-2").
+    damp: float  # EN: Numeric damp.
+    train_mean: float  # EN: Mean training RMSE across folds.
+    train_std: float  # EN: Std training RMSE across folds.
+    val_mean: float  # EN: Mean validation RMSE across folds.
+    val_std: float  # EN: Std validation RMSE across folds.
+    x_norm_mean: float  # EN: Mean ||x|| across folds (shrinkage proxy).
+    iters_mean: float  # EN: Mean iterations across folds (cost proxy).
+
+
+@dataclass(frozen=True)  # EN: Immutable record for CV sweep totals (whole curve cost).
+class CVTotals:  # EN: Store total cost for sweeping all damps for one preconditioner configuration.
+    precond: str  # EN: Preconditioner label.
+    total_build_seconds: float  # EN: Sum of preconditioner build time across all fits.
+    total_solve_seconds: float  # EN: Sum of solver time across all fits.
+    total_iters: int  # EN: Sum of iterations across all fits.
+
 def print_separator(title: str) -> None:  # EN: Print a section separator for console readability.
     print()  # EN: Add a blank line before the section.
     print("=" * 78)  # EN: Print divider line.
@@ -68,6 +97,38 @@ def l2_norm(x: np.ndarray) -> float:  # EN: Compute Euclidean norm (2-norm).
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:  # EN: Compute root-mean-square error.
     err = y_pred - y_true  # EN: Prediction error vector.
     return float(np.sqrt(np.mean(err**2)))  # EN: RMSE is sqrt(mean squared error).
+
+
+def ascii_bar(value: float, vmin: float, vmax: float, width: int = 30) -> str:  # EN: Render an ASCII bar where lower values -> longer bars.
+    if width <= 0:  # EN: Validate width.
+        return ""  # EN: Return empty bar.
+    if vmax <= vmin + EPS:  # EN: Handle near-constant series.
+        return "#" * width  # EN: Return full bar.
+    score = (vmax - value) / (vmax - vmin)  # EN: Map lower -> higher score in [0,1].
+    score = float(np.clip(score, 0.0, 1.0))  # EN: Clamp to [0,1].
+    n = int(round(score * width))  # EN: Convert score to character count.
+    return "#" * n  # EN: Return bar string.
+
+
+def k_fold_splits(  # EN: Build deterministic k-fold splits (train_idx, val_idx).
+    rng: np.random.Generator,  # EN: RNG for shuffling.
+    n_samples: int,  # EN: Total sample count.
+    n_folds: int,  # EN: Number of folds.
+) -> list[tuple[np.ndarray, np.ndarray]]:  # EN: Return list of (train_idx, val_idx).
+    if n_folds < 2:  # EN: Require at least 2 folds.
+        raise ValueError("n_folds must be >= 2")  # EN: Reject invalid fold count.
+    if n_samples < n_folds:  # EN: Ensure each fold can be non-empty.
+        raise ValueError("n_samples must be >= n_folds")  # EN: Reject impossible split.
+
+    perm = rng.permutation(n_samples)  # EN: Shuffle indices deterministically.
+    folds = np.array_split(perm, n_folds)  # EN: Split into roughly equal folds.
+
+    splits: list[tuple[np.ndarray, np.ndarray]] = []  # EN: Collect split pairs.
+    for i in range(n_folds):  # EN: Use fold i as validation fold.
+        val_idx = folds[i]  # EN: Validation indices.
+        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != i])  # EN: Training indices.
+        splits.append((train_idx, val_idx))  # EN: Store split.
+    return splits  # EN: Return splits list.
 
 
 def generate_random_sparse_csr(  # EN: Generate a random sparse matrix with fixed nnz per row (CSR).
@@ -98,36 +159,42 @@ def generate_random_sparse_csr(  # EN: Generate a random sparse matrix with fixe
     return CSRMatrix(data=data, indices=indices, indptr=indptr, shape=(int(m), int(n)))  # EN: Return CSR container.
 
 
-def csr_matvec(A: CSRMatrix, x: np.ndarray) -> np.ndarray:  # EN: Compute y = A x for CSR matrix A.
+def csr_matvec(A: CSRMatrix, x: np.ndarray) -> np.ndarray:  # EN: Compute y = A x for CSR matrix A (vectorized NumPy implementation).
     m, n = A.shape  # EN: Extract matrix dimensions.
     x1 = np.asarray(x, dtype=float).reshape(-1)  # EN: Convert x to 1D float array.
     if x1.size != n:  # EN: Validate x length.
         raise ValueError("x has incompatible dimension")  # EN: Reject dimension mismatch.
+    if A.data.size == 0:  # EN: Handle empty matrix fast.
+        return np.zeros((m,), dtype=float)  # EN: Return zeros.
 
-    y = np.zeros((m,), dtype=float)  # EN: Allocate output vector.
-    for i in range(m):  # EN: Loop rows.
-        start = int(A.indptr[i])  # EN: Row start pointer.
-        end = int(A.indptr[i + 1])  # EN: Row end pointer.
-        cols = A.indices[start:end]  # EN: Column indices for this row.
-        vals = A.data[start:end]  # EN: Nonzero values for this row.
-        y[i] = float(np.dot(vals, x1[cols]))  # EN: Row dot-product against selected x entries.
-    return y  # EN: Return y = A x.
+    # EN: For CSR, nonzeros are stored row-by-row, so we can multiply per-nnz and then reduce within each row segment.  # EN: Explain vectorization.
+    prod = A.data * x1[A.indices]  # EN: Multiply each nonzero by its corresponding x entry.
+    y = np.add.reduceat(prod, A.indptr[:-1])  # EN: Sum products within each row segment.
+    return y.astype(float)  # EN: Return y as float.
 
 
-def csr_rmatvec(A: CSRMatrix, y: np.ndarray) -> np.ndarray:  # EN: Compute x = A^T y for CSR matrix A.
+def csr_rmatvec(  # EN: Compute x = A^T y for CSR matrix A (vectorized with optional precomputed row indices).
+    A: CSRMatrix,  # EN: Sparse matrix in CSR.
+    y: np.ndarray,  # EN: Input vector in R^m.
+    row_indices: np.ndarray | None = None,  # EN: Optional per-nnz row index array to avoid recomputing np.repeat each call.
+) -> np.ndarray:  # EN: Return x in R^n.
     m, n = A.shape  # EN: Extract dimensions.
     y1 = np.asarray(y, dtype=float).reshape(-1)  # EN: Convert y to 1D float array.
     if y1.size != m:  # EN: Validate y length.
         raise ValueError("y has incompatible dimension")  # EN: Reject dimension mismatch.
+    if A.data.size == 0:  # EN: Handle empty matrix fast.
+        return np.zeros((n,), dtype=float)  # EN: Return zeros.
 
-    x = np.zeros((n,), dtype=float)  # EN: Allocate output x in R^n.
-    for i in range(m):  # EN: Loop rows of A (entries contribute to columns of A^T).
-        start = int(A.indptr[i])  # EN: Row start pointer.
-        end = int(A.indptr[i + 1])  # EN: Row end pointer.
-        cols = A.indices[start:end]  # EN: Column indices for this row.
-        vals = A.data[start:end]  # EN: Values for this row.
-        x[cols] += vals * y1[i]  # EN: Accumulate contributions into x at the referenced columns.
-    return x  # EN: Return x = A^T y.
+    if row_indices is None:  # EN: Build row index per nonzero when not provided.
+        row_indices = np.repeat(np.arange(m, dtype=int), np.diff(A.indptr).astype(int))  # EN: Map each nnz to its row id.
+    row_idx = np.asarray(row_indices, dtype=int).reshape(-1)  # EN: Ensure row_indices is a 1D int array.
+    if row_idx.size != A.data.size:  # EN: Validate that row_indices matches nnz length.
+        raise ValueError("row_indices length must match nnz")  # EN: Reject mismatched helper array.
+
+    contrib = A.data * y1[row_idx]  # EN: Each nnz contributes data[p] * y[row(p)].
+    x = np.zeros((n,), dtype=float)  # EN: Allocate output x.
+    np.add.at(x, A.indices, contrib)  # EN: Accumulate contributions into columns (transpose matvec).
+    return x.astype(float)  # EN: Return x as float.
 
 
 def csr_column_norms_sq(A: CSRMatrix) -> np.ndarray:  # EN: Compute column squared norms ||A[:,j]||_2^2 for a CSR matrix.
@@ -135,6 +202,36 @@ def csr_column_norms_sq(A: CSRMatrix) -> np.ndarray:  # EN: Compute column squar
     col_sq = np.zeros((n,), dtype=float)  # EN: Allocate accumulator for column squared norms.
     np.add.at(col_sq, A.indices, A.data * A.data)  # EN: Add each nonzero's square into its column bin.
     return col_sq  # EN: Return column squared norms.
+
+
+def csr_select_rows(A: CSRMatrix, row_ids: np.ndarray) -> CSRMatrix:  # EN: Build a CSR submatrix consisting of selected rows (in the given order).
+    m, n = A.shape  # EN: Extract original shape.
+    rows = np.asarray(row_ids, dtype=int).reshape(-1)  # EN: Convert row ids to a 1D int array.
+    if rows.size == 0:  # EN: Handle empty selection.
+        return CSRMatrix(data=np.array([], dtype=float), indices=np.array([], dtype=int), indptr=np.zeros((1,), dtype=int), shape=(0, int(n)))  # EN: Return empty CSR matrix.
+    if np.any(rows < 0) or np.any(rows >= m):  # EN: Validate bounds.
+        raise ValueError("row_ids out of bounds")  # EN: Reject invalid row indices.
+
+    nnz_per_row = (A.indptr[rows + 1] - A.indptr[rows]).astype(int)  # EN: Compute nnz in each selected row.
+    nnz_new = int(np.sum(nnz_per_row))  # EN: Total nnz in the new matrix.
+
+    data_new = np.empty((nnz_new,), dtype=float)  # EN: Allocate new data array.
+    indices_new = np.empty((nnz_new,), dtype=int)  # EN: Allocate new indices array.
+    indptr_new = np.zeros((rows.size + 1,), dtype=int)  # EN: Allocate new indptr array.
+
+    cursor = 0  # EN: Write cursor into the new data/indices arrays.
+    for i_new, i_old in enumerate(rows):  # EN: Copy rows one-by-one into the new CSR.
+        start_old = int(A.indptr[int(i_old)])  # EN: Old row start pointer.
+        end_old = int(A.indptr[int(i_old) + 1])  # EN: Old row end pointer.
+        row_nnz = int(end_old - start_old)  # EN: Number of nonzeros in this row.
+        indptr_new[i_new] = int(cursor)  # EN: Record row start in new CSR.
+        if row_nnz > 0:  # EN: Copy row slices when non-empty.
+            data_new[cursor : cursor + row_nnz] = A.data[start_old:end_old]  # EN: Copy nonzero values.
+            indices_new[cursor : cursor + row_nnz] = A.indices[start_old:end_old]  # EN: Copy column indices.
+        cursor += row_nnz  # EN: Advance cursor by row nnz.
+    indptr_new[rows.size] = int(cursor)  # EN: Final pointer equals nnz_new.
+
+    return CSRMatrix(data=data_new.astype(float), indices=indices_new.astype(int), indptr=indptr_new.astype(int), shape=(int(rows.size), int(n)))  # EN: Return the row-selected CSR matrix.
 
 
 def build_tridiagonal_T_from_golub_kahan(  # EN: Build T_k = B_k^T B_k from GK bidiagonalization coefficients.
@@ -154,10 +251,92 @@ def column_scaling_D_aug_from_col_sq(col_sq: np.ndarray, damp: float) -> np.ndar
     return np.sqrt(np.maximum(col_sq + (float(damp) * float(damp)), EPS)).astype(float)  # EN: Compute and return D.
 
 
-def build_preconditioner(  # EN: Build right preconditioner for the sparse operator (none or column scaling).
+def choose_sketch_rows(m_aug: int, n: int, sketch_factor: float) -> int:  # EN: Choose sketch row count s for an oversampled rand-QR preconditioner.
+    s_target = int(round(float(sketch_factor) * float(n)))  # EN: Oversampled target like 4n.
+    s = int(max(n, min(m_aug, s_target)))  # EN: Clamp s into [n, m_aug] so QR is well-posed.
+    return int(s)  # EN: Return as Python int.
+
+
+def build_countsketch_aug(  # EN: Build a CountSketch for the augmented matrix [A; damp I] that can be reused across damp values.
+    A: CSRMatrix,  # EN: Sparse design matrix in CSR (shape m×n).
+    sketch_factor: float,  # EN: Oversampling factor for sketch rows (e.g., 4.0 => s≈4n).
+    rng: np.random.Generator,  # EN: RNG for sketch construction.
+) -> CountSketchAug:  # EN: Return CountSketchAug with SA_top and identity hashing.
+    m, n = A.shape  # EN: Extract dimensions.
+    m_aug = int(m + n)  # EN: Augmented row count for [A; damp I].
+    s = choose_sketch_rows(m_aug=m_aug, n=int(n), sketch_factor=float(sketch_factor))  # EN: Choose sketch row count.
+    scale = float(1.0 / np.sqrt(max(s, 1)))  # EN: Use 1/sqrt(s) scaling (keeps norms comparable).
+
+    # EN: CountSketch: each original row is mapped to one sketch row with a random sign.  # EN: Explain sketch structure.
+    h_top = rng.integers(low=0, high=s, size=int(m), dtype=int)  # EN: Hash bucket for each data row.
+    sign_top = rng.choice(np.array([-1.0, 1.0]), size=int(m)).astype(float)  # EN: Random sign for each data row.
+
+    h_bottom = rng.integers(low=0, high=s, size=int(n), dtype=int)  # EN: Hash bucket for each identity row (one per feature).
+    sign_bottom = rng.choice(np.array([-1.0, 1.0]), size=int(n)).astype(float)  # EN: Random sign for each identity row.
+
+    SA_top = np.zeros((int(s), int(n)), dtype=float)  # EN: Allocate dense sketch matrix for S_top A.
+
+    # EN: Compute SA_top = S_top A in O(nnz) by accumulating each sparse row into its hashed sketch row.  # EN: Explain loop.
+    for i in range(int(m)):  # EN: Loop over data rows.
+        row_bucket = int(h_top[i])  # EN: Sketch row index for this data row.
+        row_sign = float(sign_top[i])  # EN: Random sign for this data row.
+        start = int(A.indptr[i])  # EN: Row start pointer.
+        end = int(A.indptr[i + 1])  # EN: Row end pointer.
+        cols = A.indices[start:end]  # EN: Column indices for this row.
+        vals = A.data[start:end]  # EN: Nonzero values for this row.
+        if cols.size > 0:  # EN: Skip empty rows.
+            SA_top[row_bucket, cols] += (scale * row_sign) * vals  # EN: Add signed row into the sketch.
+
+    return CountSketchAug(  # EN: Return sketch container.
+        SA_top=SA_top.astype(float),  # EN: Store SA_top.
+        h_bottom=h_bottom.astype(int),  # EN: Store identity hashes.
+        sign_bottom=sign_bottom.astype(float),  # EN: Store identity signs.
+        scale=float(scale),  # EN: Store scaling factor.
+        s=int(s),  # EN: Store sketch row count.
+    )  # EN: End return.
+
+
+def randqr_R_from_countsketch(sketch: CountSketchAug, damp: float) -> np.ndarray:  # EN: Compute R from QR(S [A; damp I]) using a prebuilt CountSketch.
+    n = int(sketch.SA_top.shape[1])  # EN: Extract n from SA_top.
+    A_sketch = sketch.SA_top.copy()  # EN: Start from S_top A (data contribution).
+    j = np.arange(n, dtype=int)  # EN: Column indices for the identity contribution.
+    # EN: Since A_aug=[A;damp I], the identity rows contribute damp*(scale*sign_bottom) at (h_bottom[j], j).  # EN: Explain update.
+    np.add.at(A_sketch, (sketch.h_bottom, j), (float(damp) * float(sketch.scale)) * sketch.sign_bottom)  # EN: Add hashed identity contribution.
+
+    # EN: Reduced QR gives SA_aug = Q R, with R (n×n) upper-triangular.  # EN: Explain QR output.
+    _, R = np.linalg.qr(A_sketch, mode="reduced")  # EN: Compute QR to extract R.
+
+    # EN: Flip signs so diag(R) is non-negative (stabilizes triangular solves).  # EN: Explain sign convention.
+    d = np.sign(np.diag(R))  # EN: Diagonal sign vector.
+    d[d == 0.0] = 1.0  # EN: Replace zeros with +1.
+    R = np.diag(d) @ R  # EN: Apply sign flips.
+
+    # EN: Add a tiny diagonal jitter if R is nearly singular (defensive for extreme cases).  # EN: Explain jitter.
+    jitter = 1e-12 * float(np.linalg.norm(R, ord="fro"))  # EN: Scale jitter by Frobenius norm.
+    R = R + jitter * np.eye(R.shape[0], dtype=float)  # EN: Stabilize R for solves.
+    return R.astype(float)  # EN: Return R as float.
+
+
+def upper_triangular_preconditioner_from_R(  # EN: Create right-preconditioner apply_Minv/apply_Minv_T closures from an upper-triangular R.
+    R: np.ndarray,  # EN: Upper-triangular matrix defining M=R.
+    label: str,  # EN: Human-readable label for printing.
+) -> tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]]:  # EN: Return (label, Minv, Minv_T).
+    def apply_Minv(y: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-1} via triangular solve.
+        return np.linalg.solve(R, y)  # EN: Solve R x = y.
+
+    def apply_Minv_T(z: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-T} via triangular solve.
+        return np.linalg.solve(R.T, z)  # EN: Solve R^T x = z.
+
+    return str(label), apply_Minv, apply_Minv_T  # EN: Return preconditioner functions.
+
+
+def build_preconditioner(  # EN: Build a right preconditioner for the sparse operator (none / col-scaling / rand-QR).
     kind: PrecondKind,  # EN: Preconditioner kind.
-    col_sq: np.ndarray,  # EN: Column squared norms of A (precomputed once).
-    damp: float,  # EN: Damping parameter (affects augmented column norms).
+    A: CSRMatrix,  # EN: Sparse design matrix (needed for rand-QR).
+    col_sq: np.ndarray,  # EN: Column squared norms of A (used by col-scaling).
+    damp: float,  # EN: Damping parameter (affects augmented column norms and rand-QR).
+    rng: np.random.Generator,  # EN: RNG for randomized preconditioners (ignored for deterministic kinds).
+    sketch_factor: float = 4.0,  # EN: Oversampling factor for rand-QR sketches (e.g., 4.0 => s≈4n).
 ) -> tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray], float]:  # EN: Return (label, Minv, Minv_T, build_seconds).
     n = int(col_sq.size)  # EN: Feature dimension.
     _ = n  # EN: Keep n visible for readability (used in closures).
@@ -185,6 +364,14 @@ def build_preconditioner(  # EN: Build right preconditioner for the sparse opera
         def apply_Minv_T(z: np.ndarray, D: np.ndarray = D) -> np.ndarray:  # EN: Apply D^{-T} = D^{-1} (diagonal).
             return z / D  # EN: Elementwise divide.
 
+        return label, apply_Minv, apply_Minv_T, build_seconds  # EN: Return preconditioner and timing.
+
+    if kind == "randqr":  # EN: Randomized QR preconditioner built from a CountSketch of the augmented matrix.
+        t0 = perf_counter()  # EN: Start build timer.
+        sketch = build_countsketch_aug(A=A, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch blocks for this matrix.
+        R = randqr_R_from_countsketch(sketch=sketch, damp=float(damp))  # EN: Build R from QR of the sketched augmented matrix.
+        build_seconds = float(perf_counter() - t0)  # EN: Stop build timer.
+        label, apply_Minv, apply_Minv_T = upper_triangular_preconditioner_from_R(R=R, label="rand-QR(countsketch)")  # EN: Create apply closures.
         return label, apply_Minv, apply_Minv_T, build_seconds  # EN: Return preconditioner and timing.
 
     raise ValueError("Unknown preconditioner kind")  # EN: Guard against invalid kind.
@@ -352,7 +539,10 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
     max_iters: int,  # EN: Iteration cap.
     atol: float,  # EN: Absolute tolerance.
     btol: float,  # EN: Relative tolerance.
+    rng: np.random.Generator,  # EN: RNG for randomized preconditioners (rand-QR).
     x_init: np.ndarray | None = None,  # EN: Optional warm-start initial guess in x-space.
+    precond_override: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None,  # EN: Optional prebuilt (label, Minv, Minv_T).
+    build_seconds_override: float | None = None,  # EN: Optional build-time override (used when precond_override is provided).
 ) -> SolveReport:  # EN: Return structured diagnostics for this run.
     m, n = A.shape  # EN: Extract dimensions.
     damp_f = float(damp)  # EN: Ensure damp is a float.
@@ -360,7 +550,18 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
     # EN: Use a deterministic upper bound for ||A_aug||_2 via Frobenius: ||A_aug||_2 <= ||A_aug||_F.  # EN: Explain estimate choice.
     anorm_est = float(np.sqrt(float(fro_sq) + (damp_f * damp_f) * float(n)))  # EN: Compute ||[A;damp I]||_F.
 
-    label, apply_Minv, apply_Minv_T, build_seconds = build_preconditioner(kind=precond_kind, col_sq=col_sq, damp=damp_f)  # EN: Build preconditioner.
+    # EN: Choose the preconditioner: either build it here, or reuse a prebuilt one supplied by the caller.  # EN: Explain override.
+    if precond_override is None:  # EN: Default behavior: build preconditioner per call.
+        label, apply_Minv, apply_Minv_T, build_seconds = build_preconditioner(  # EN: Build preconditioner.
+            kind=precond_kind,  # EN: Preconditioner kind.
+            A=A,  # EN: Provide sparse matrix A (used by rand-QR).
+            col_sq=col_sq,  # EN: Provide column norms (used by col-scaling).
+            damp=damp_f,  # EN: Provide damp.
+            rng=rng,  # EN: Provide RNG.
+        )  # EN: End build call.
+    else:  # EN: Reuse an externally built preconditioner (e.g., shared sketch across a damp sweep).
+        label, apply_Minv, apply_Minv_T = precond_override  # EN: Unpack prebuilt closures.
+        build_seconds = float(build_seconds_override) if build_seconds_override is not None else 0.0  # EN: Charge explicit build time (or 0).
 
     # EN: Warm-start via a correction solve with RHS [b-Ax0; -damp x0].  # EN: Explain technique.
     if x_init is None:  # EN: No warm-start.
@@ -434,6 +635,244 @@ def print_solver_table(reports: list[SolveReport]) -> None:  # EN: Print a compa
         )  # EN: End print.
 
 
+def print_cv_table(points: list[CVPoint], best: CVPoint) -> None:  # EN: Print a CV table with an ASCII curve and iteration proxy.
+    points_sorted = sorted(points, key=lambda p: p.damp)  # EN: Sort by damp for readability.
+    vals = [p.val_mean for p in points_sorted]  # EN: Collect validation means for bar scaling.
+    vmin = min(vals)  # EN: Minimum validation mean.
+    vmax = max(vals)  # EN: Maximum validation mean.
+
+    header = (  # EN: Build the table header.
+        "param        | train_rmse(mean±std) | val_rmse(mean±std) | ||x||_2(mean) | iters(mean) | curve"  # EN: Column names.
+    )  # EN: End header.
+    print(header)  # EN: Print header.
+    print("-" * len(header))  # EN: Print divider.
+
+    for p in points_sorted:  # EN: Print each row.
+        mark = " <== best" if p.key == best.key else ""  # EN: Mark best damp.
+        bar = ascii_bar(value=p.val_mean, vmin=vmin, vmax=vmax, width=26)  # EN: Build ASCII curve bar.
+        print(  # EN: Print formatted row.
+            f"{p.key:12} | "  # EN: Damp label.
+            f"{p.train_mean:.3e}±{p.train_std:.1e} | "  # EN: Train RMSE.
+            f"{p.val_mean:.3e}±{p.val_std:.1e} | "  # EN: Val RMSE.
+            f"{p.x_norm_mean:.3e} | "  # EN: Mean ||x||.
+            f"{p.iters_mean:10.1f} | "  # EN: Mean iterations.
+            f"{bar}{mark}"  # EN: Bar + marker.
+        )  # EN: End print.
+
+
+def choose_fixed_randqr_reference_damp(damps_sorted: np.ndarray) -> float:  # EN: Pick a representative damp for building a fixed rand-QR preconditioner.
+    positive = damps_sorted[damps_sorted > 0.0]  # EN: Filter to strictly positive damps.
+    if positive.size == 0:  # EN: If no positive damp exists, fall back to 0.
+        return 0.0  # EN: Return zero reference.
+    return float(positive[positive.size // 2])  # EN: Return the median positive damp (in sorted order).
+
+
+def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse CSR matrix, accumulating total cost.
+    splits: list[tuple[np.ndarray, np.ndarray]],  # EN: CV splits (train_idx, val_idx).
+    A_full: CSRMatrix,  # EN: Full sparse design matrix (rows will be selected per fold).
+    b_full: np.ndarray,  # EN: Full targets vector (length m_full).
+    damps: np.ndarray,  # EN: Damp grid to sweep (will be sorted ascending for reporting).
+    precond_kind: PrecondKind,  # EN: Preconditioner kind (none/col/randqr).
+    randqr_policy: RandQRPolicy,  # EN: Policy for rand-QR (ignored unless precond_kind == "randqr").
+    warm_start: bool,  # EN: Whether to use continuation/warm-start across the damp grid within each fold.
+    max_iters: int,  # EN: Iteration cap.
+    atol: float,  # EN: Absolute tolerance.
+    btol: float,  # EN: Relative tolerance.
+    sketch_factor: float,  # EN: Oversampling factor for rand-QR sketches.
+    rng: np.random.Generator,  # EN: RNG for sketches and split-specific randomness.
+) -> tuple[list[CVPoint], CVTotals, CVPoint]:  # EN: Return (points, totals, best_point).
+    damps_sorted = np.array(sorted([float(d) for d in damps]), dtype=float)  # EN: Sort damps ascending for reporting.
+    n_damps = int(damps_sorted.size)  # EN: Number of damp values.
+    n_folds = int(len(splits))  # EN: Number of folds.
+    n_features = int(A_full.shape[1])  # EN: Feature count.
+
+    order = np.arange(n_damps, dtype=int)  # EN: Default evaluation order is ascending.
+    if warm_start:  # EN: For continuation, starting from large damp is often more stable (solution near 0).
+        order = order[::-1]  # EN: Evaluate from largest damp down to smallest.
+
+    train_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store train RMSE per (damp, fold).
+    val_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store val RMSE per (damp, fold).
+    xnorm_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store ||x|| per (damp, fold).
+    iters_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store iterations per (damp, fold).
+
+    total_build = 0.0  # EN: Accumulate preconditioner build time across all fits.
+    total_solve = 0.0  # EN: Accumulate solver time across all fits.
+    total_iters = 0  # EN: Accumulate iterations across all fits.
+
+    # EN: Build a readable label for this configuration (used in summaries).  # EN: Explain labeling.
+    if precond_kind == "none":  # EN: Baseline no-preconditioner label.
+        label = "none"  # EN: Label.
+    elif precond_kind == "col":  # EN: Column-scaling label.
+        label = "col-scaling"  # EN: Label.
+    else:  # EN: rand-QR label depends on policy.
+        policy_tag = {"rebuild": "rand-QR(rebuild)", "shared_sketch": "rand-QR(shared)", "fixed_R": "rand-QR(fixed-R)"}[randqr_policy]  # EN: Map policy to a readable tag.
+        label = policy_tag  # EN: Assign label.
+    if warm_start:  # EN: Annotate label when warm-start is enabled.
+        label = f"{label}+ws"  # EN: Append warm-start suffix.
+
+    damp_ref = choose_fixed_randqr_reference_damp(damps_sorted)  # EN: Reference damp for fixed-R policy.
+
+    for fold_id, (train_idx, val_idx) in enumerate(splits):  # EN: Loop folds (outer) to enable continuation within each fold.
+        A_tr = csr_select_rows(A=A_full, row_ids=train_idx)  # EN: Build training CSR matrix.
+        b_tr = np.asarray(b_full, dtype=float).reshape(-1)[train_idx]  # EN: Slice training targets.
+        A_va = csr_select_rows(A=A_full, row_ids=val_idx)  # EN: Build validation CSR matrix.
+        b_va = np.asarray(b_full, dtype=float).reshape(-1)[val_idx]  # EN: Slice validation targets.
+
+        col_sq_tr = csr_column_norms_sq(A_tr)  # EN: Column norms for training matrix (used by col-scaling).
+        fro_sq_tr = float(np.sum(A_tr.data * A_tr.data))  # EN: ||A_tr||_F^2 for norm bounds.
+
+        row_idx_tr = np.repeat(np.arange(A_tr.shape[0], dtype=int), np.diff(A_tr.indptr).astype(int))  # EN: Precompute row index per nnz for A_tr^T matvec.
+
+        def matvec_A_tr(x: np.ndarray, A_tr: CSRMatrix = A_tr) -> np.ndarray:  # EN: Training matvec A_tr x.
+            return csr_matvec(A=A_tr, x=x)  # EN: Compute A_tr x.
+
+        def matvec_AT_tr(y: np.ndarray, A_tr: CSRMatrix = A_tr, row_idx_tr: np.ndarray = row_idx_tr) -> np.ndarray:  # EN: Training transpose matvec A_tr^T y.
+            return csr_rmatvec(A=A_tr, y=y, row_indices=row_idx_tr)  # EN: Compute A_tr^T y.
+
+        x_prev = np.zeros((n_features,), dtype=float)  # EN: Initialize continuation with x=0 for the first step.
+
+        # EN: Build per-fold cached objects for rand-QR reuse policies (since A_tr changes per fold).  # EN: Explain caching scope.
+        shared_sketch: CountSketchAug | None = None  # EN: Shared sketch for this fold (optional).
+        fixed_precond: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None  # EN: Fixed-R preconditioner closures (optional).
+
+        if precond_kind == "randqr" and randqr_policy in {"shared_sketch", "fixed_R"}:  # EN: Build shared CountSketch once per fold.
+            t0 = perf_counter()  # EN: Start sketch build timer.
+            shared_sketch = build_countsketch_aug(A=A_tr, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch blocks.
+            total_build += float(perf_counter() - t0)  # EN: Account for one-time sketch build cost.
+
+        if precond_kind == "randqr" and randqr_policy == "fixed_R":  # EN: Build a fixed R once per fold (then reuse across all damps).
+            if shared_sketch is None:  # EN: Defensive: fixed-R requires a sketch.
+                raise RuntimeError("internal error: shared_sketch is None for fixed_R policy")  # EN: Fail fast.
+            t0 = perf_counter()  # EN: Start R build timer.
+            R_ref = randqr_R_from_countsketch(sketch=shared_sketch, damp=float(damp_ref))  # EN: Build R at reference damp.
+            total_build += float(perf_counter() - t0)  # EN: Account for one-time QR cost.
+            fixed_precond = upper_triangular_preconditioner_from_R(R=R_ref, label="rand-QR(fixed-R)")  # EN: Build apply closures.
+
+        for step, idx in enumerate(order):  # EN: Sweep damp values in the chosen continuation order.
+            damp = float(damps_sorted[idx])  # EN: Current damp value.
+            x_init = x_prev if (warm_start and step > 0) else None  # EN: Use previous x as warm-start except for the first step.
+
+            # EN: Choose how to build/reuse the preconditioner for this fit.  # EN: Explain branching.
+            if precond_kind != "randqr":  # EN: Non-randQR paths use the standard builder inside solve_one_sparse.
+                rep = solve_one_sparse(  # EN: Fit on the training fold.
+                    A=A_tr,  # EN: Training A.
+                    matvec_A=matvec_A_tr,  # EN: Training matvec A.
+                    matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
+                    col_sq=col_sq_tr,  # EN: Column norms for training A.
+                    fro_sq=fro_sq_tr,  # EN: Frobenius squared for training A.
+                    b=b_tr,  # EN: Training targets.
+                    damp=float(damp),  # EN: Damp.
+                    precond_kind=precond_kind,  # EN: Preconditioner kind.
+                    max_iters=max_iters,  # EN: Cap.
+                    atol=atol,  # EN: atol.
+                    btol=btol,  # EN: btol.
+                    rng=rng,  # EN: RNG (unused by deterministic kinds).
+                    x_init=x_init,  # EN: Warm-start (optional).
+                )  # EN: End solve.
+            else:  # EN: rand-QR path supports rebuild/shared/fixed policies.
+                if randqr_policy == "rebuild":  # EN: Baseline: rebuild sketch and QR for every damp.
+                    rep = solve_one_sparse(  # EN: Fit with per-call rand-QR build.
+                        A=A_tr,  # EN: Training A.
+                        matvec_A=matvec_A_tr,  # EN: Training matvec A.
+                        matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
+                        col_sq=col_sq_tr,  # EN: Column norms.
+                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        b=b_tr,  # EN: Training targets.
+                        damp=float(damp),  # EN: Damp.
+                        precond_kind="randqr",  # EN: rand-QR.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        rng=rng,  # EN: RNG (used by rand-QR rebuild).
+                        x_init=x_init,  # EN: Warm-start (optional).
+                    )  # EN: End solve.
+                elif randqr_policy == "shared_sketch":  # EN: Rebuild R per damp, but reuse the expensive sketch SA_top.
+                    if shared_sketch is None:  # EN: Defensive check.
+                        raise RuntimeError("internal error: shared_sketch is None for shared_sketch policy")  # EN: Fail fast.
+                    t0 = perf_counter()  # EN: Time only the R-from-sketch build for this damp.
+                    R = randqr_R_from_countsketch(sketch=shared_sketch, damp=float(damp))  # EN: Build R using shared sketch.
+                    build_s = float(perf_counter() - t0)  # EN: Record per-damp QR build time.
+                    precond = upper_triangular_preconditioner_from_R(R=R, label="rand-QR(shared)")  # EN: Create apply closures from R.
+                    rep = solve_one_sparse(  # EN: Fit with an externally built preconditioner.
+                        A=A_tr,  # EN: Training A.
+                        matvec_A=matvec_A_tr,  # EN: Training matvec A.
+                        matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
+                        col_sq=col_sq_tr,  # EN: Column norms.
+                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        b=b_tr,  # EN: Training targets.
+                        damp=float(damp),  # EN: Damp.
+                        precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        rng=rng,  # EN: RNG (unused due to override).
+                        x_init=x_init,  # EN: Warm-start (optional).
+                        precond_override=precond,  # EN: Use the prebuilt preconditioner closures.
+                        build_seconds_override=build_s,  # EN: Charge only QR time (sketch build charged once per fold above).
+                    )  # EN: End solve.
+                elif randqr_policy == "fixed_R":  # EN: Reuse the SAME R preconditioner for all damp values in the curve.
+                    if fixed_precond is None:  # EN: Defensive check.
+                        raise RuntimeError("internal error: fixed_precond is None for fixed_R policy")  # EN: Fail fast.
+                    rep = solve_one_sparse(  # EN: Fit with the reused preconditioner.
+                        A=A_tr,  # EN: Training A.
+                        matvec_A=matvec_A_tr,  # EN: Training matvec A.
+                        matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
+                        col_sq=col_sq_tr,  # EN: Column norms.
+                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        b=b_tr,  # EN: Training targets.
+                        damp=float(damp),  # EN: Damp (objective still changes, only M is fixed).
+                        precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        rng=rng,  # EN: RNG (unused due to override).
+                        x_init=x_init,  # EN: Warm-start (optional).
+                        precond_override=fixed_precond,  # EN: Use the fixed-R preconditioner closures.
+                        build_seconds_override=0.0,  # EN: No per-damp build cost when R is fixed.
+                    )  # EN: End solve.
+                else:  # EN: Guard against unknown policy values.
+                    raise ValueError("Unknown randqr_policy")  # EN: Reject invalid policy.
+
+            x_prev = rep.x_hat  # EN: Update continuation state for the next damp (used only when warm_start=True).
+
+            train_pred = csr_matvec(A=A_tr, x=rep.x_hat)  # EN: Compute training predictions A_tr x_hat.
+            val_pred = csr_matvec(A=A_va, x=rep.x_hat)  # EN: Compute validation predictions A_va x_hat.
+
+            train_rmse_mat[idx, fold_id] = rmse(y_true=b_tr, y_pred=train_pred)  # EN: Store train RMSE.
+            val_rmse_mat[idx, fold_id] = rmse(y_true=b_va, y_pred=val_pred)  # EN: Store validation RMSE.
+            xnorm_mat[idx, fold_id] = float(rep.xnorm)  # EN: Store ||x||.
+            iters_mat[idx, fold_id] = float(rep.n_iters)  # EN: Store iterations.
+
+            total_build += float(rep.build_seconds)  # EN: Add per-fit build time.
+            total_solve += float(rep.solve_seconds)  # EN: Add per-fit solve time.
+            total_iters += int(rep.n_iters)  # EN: Add per-fit iterations.
+
+    points: list[CVPoint] = []  # EN: Collect per-damp CV summaries.
+    for i, damp in enumerate(damps_sorted):  # EN: Summarize each damp across folds.
+        train_row = train_rmse_mat[i, :]  # EN: Train RMSE values across folds.
+        val_row = val_rmse_mat[i, :]  # EN: Val RMSE values across folds.
+        x_row = xnorm_mat[i, :]  # EN: ||x|| values across folds.
+        it_row = iters_mat[i, :]  # EN: Iteration counts across folds.
+
+        key = f"d={damp:.0e}" if damp != 0.0 else "d=0"  # EN: Format parameter label.
+        points.append(  # EN: Append a CVPoint for this damp.
+            CVPoint(
+                key=key,  # EN: Label.
+                damp=float(damp),  # EN: Damp value.
+                train_mean=float(np.mean(train_row)),  # EN: Mean train RMSE.
+                train_std=float(np.std(train_row)),  # EN: Std train RMSE.
+                val_mean=float(np.mean(val_row)),  # EN: Mean val RMSE.
+                val_std=float(np.std(val_row)),  # EN: Std val RMSE.
+                x_norm_mean=float(np.mean(x_row)),  # EN: Mean ||x||.
+                iters_mean=float(np.mean(it_row)),  # EN: Mean iterations.
+            )
+        )  # EN: End append.
+
+    best = min(points, key=lambda p: p.val_mean)  # EN: Pick damp with lowest mean validation RMSE.
+    totals = CVTotals(precond=str(label), total_build_seconds=float(total_build), total_solve_seconds=float(total_solve), total_iters=int(total_iters))  # EN: Package totals.
+    return points, totals, best  # EN: Return curve, totals, and best point.
+
+
 def main() -> None:  # EN: Run a sparse matrix-free ridge demo with preconditioning and warm-start.
     rng = np.random.default_rng(SEED)  # EN: Create deterministic RNG.
 
@@ -449,13 +888,14 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
 
     col_sq = csr_column_norms_sq(A)  # EN: Precompute column squared norms (reused across damps).
     fro_sq = float(np.sum(A.data * A.data))  # EN: Precompute ||A||_F^2 for cheap norm bounds.
+    row_idx_A = np.repeat(np.arange(m, dtype=int), np.diff(A.indptr).astype(int))  # EN: Precompute row index per nnz for fast A^T matvec.
 
     # EN: Define matvecs so the solver never needs the dense matrix explicitly.  # EN: Explain matrix-free interface.
     def matvec_A(x: np.ndarray) -> np.ndarray:  # EN: CSR matvec for A.
         return csr_matvec(A=A, x=x)  # EN: Compute A x.
 
     def matvec_AT(y: np.ndarray) -> np.ndarray:  # EN: CSR transpose matvec for A^T.
-        return csr_rmatvec(A=A, y=y)  # EN: Compute A^T y.
+        return csr_rmatvec(A=A, y=y, row_indices=row_idx_A)  # EN: Compute A^T y using precomputed row indices.
 
     # EN: Create a sparse-ish ground-truth coefficient vector and synthetic targets b.  # EN: Explain target construction.
     x_true = np.zeros((n,), dtype=float)  # EN: Initialize x_true.
@@ -468,16 +908,18 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
     print(f"m={m}, n={n}, nnz={nnz}, nnz_per_row={nnz_per_row}, density={density:.3e}")  # EN: Print sparsity stats.
     print(f"||A||_F={np.sqrt(fro_sq):.3e}, noise_std={noise_std}")  # EN: Print Frobenius norm and noise.
 
-    # EN: Solver settings: keep the cap moderate (teaching demo).  # EN: Explain settings.
-    max_iters = 80  # EN: Iteration cap.
+    # EN: Solver settings used across experiments.  # EN: Explain settings.
+    max_iters = min(2 * n, 150)  # EN: Iteration cap (keep it moderate but allow convergence).
     atol = 1e-10  # EN: Absolute tolerance.
     btol = 1e-10  # EN: Relative tolerance.
+    sketch_factor = 4.0  # EN: Oversampling factor for rand-QR sketches (s≈4n).
 
-    # EN: Compare cold-start solves for a few damp values.  # EN: Explain experiment.
-    demo_damps = [1e-2, 1e-1, 1.0]  # EN: Damp values to compare.
-    preconds: list[PrecondKind] = ["none", "col"]  # EN: Preconditioner list.
+    # EN: Per-damp solver comparison on the full dataset (not CV).  # EN: Explain purpose.
+    demo_damps = [0.0, 1e-2, 1e-1, 1.0]  # EN: Damp values to compare.
+    preconds: list[PrecondKind] = ["none", "col", "randqr"]  # EN: Preconditioner list.
+    rng_demo = np.random.default_rng(SEED + 10)  # EN: Dedicated RNG for demo preconditioners (rand-QR).
 
-    print_separator("Cold-start comparison (each damp starts from x=0)")  # EN: Announce cold-start comparison.
+    print_separator("Per-damp solver comparison (full data)")  # EN: Announce comparison section.
     reports: list[SolveReport] = []  # EN: Collect reports.
     for d in demo_damps:  # EN: Loop damp values.
         for pk in preconds:  # EN: Loop preconditioners.
@@ -494,64 +936,129 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
                     max_iters=max_iters,  # EN: Cap.
                     atol=atol,  # EN: atol.
                     btol=btol,  # EN: btol.
+                    rng=rng_demo,  # EN: RNG (used by rand-QR).
                     x_init=None,  # EN: Cold-start.
                 )  # EN: End solve.
             )  # EN: End append.
     print_solver_table(reports)  # EN: Print table.
 
-    # EN: Demonstrate continuation / warm-start along a damp path (from large to small).  # EN: Explain continuation experiment.
-    damp_path = [10.0, 1.0, 1e-1, 1e-2]  # EN: A decreasing damp path (often more stable for continuation).
-    print_separator("Continuation / warm-start along a damp path (per preconditioner)")  # EN: Announce continuation section.
+    # EN: Build CV splits once so baseline/speedups compare on the same folds.  # EN: Explain split policy.
+    n_folds = 5  # EN: Number of folds for k-fold CV.
+    rng_split = np.random.default_rng(SEED + 20)  # EN: Dedicated RNG for deterministic splits.
+    splits = k_fold_splits(rng=rng_split, n_samples=m, n_folds=n_folds)  # EN: Build k-fold splits.
 
-    for pk in preconds:  # EN: Loop preconditioners.
-        # EN: Cold-start total cost for this path.  # EN: Explain baseline within path.
-        cold_total_iters = 0  # EN: Accumulate cold-start iterations.
-        cold_total_solve = 0.0  # EN: Accumulate cold-start solve time.
-        for d in damp_path:  # EN: Loop damps.
-            rep = solve_one_sparse(  # EN: Cold-start solve.
-                A=A,  # EN: A.
-                matvec_A=matvec_A,  # EN: matvec A.
-                matvec_AT=matvec_AT,  # EN: matvec A^T.
-                col_sq=col_sq,  # EN: col norms.
-                fro_sq=fro_sq,  # EN: Frobenius squared.
-                b=b,  # EN: b.
-                damp=float(d),  # EN: damp.
-                precond_kind=pk,  # EN: preconditioner.
-                max_iters=max_iters,  # EN: cap.
-                atol=atol,  # EN: atol.
-                btol=btol,  # EN: btol.
-                x_init=None,  # EN: cold-start.
-            )  # EN: End solve.
-            cold_total_iters += int(rep.n_iters)  # EN: Add iterations.
-            cold_total_solve += float(rep.solve_seconds)  # EN: Add solve time.
+    # EN: Damp grid for CV (include 0 plus a log-grid).  # EN: Explain hyperparameter grid.
+    damps = np.concatenate(([0.0], np.logspace(-6, 1, num=12)))  # EN: Candidate damps for CV.
 
-        # EN: Warm-start total cost for this path.  # EN: Explain warm-start.
-        warm_total_iters = 0  # EN: Accumulate warm-start iterations.
-        warm_total_solve = 0.0  # EN: Accumulate warm-start solve time.
-        x_prev: np.ndarray | None = None  # EN: Store previous solution for continuation.
-        for i, d in enumerate(damp_path):  # EN: Loop damps in path order.
-            rep = solve_one_sparse(  # EN: Warm-start solve (x_init from previous damp).
-                A=A,  # EN: A.
-                matvec_A=matvec_A,  # EN: matvec A.
-                matvec_AT=matvec_AT,  # EN: matvec A^T.
-                col_sq=col_sq,  # EN: col norms.
-                fro_sq=fro_sq,  # EN: Frobenius squared.
-                b=b,  # EN: b.
-                damp=float(d),  # EN: damp.
-                precond_kind=pk,  # EN: preconditioner.
-                max_iters=max_iters,  # EN: cap.
-                atol=atol,  # EN: atol.
-                btol=btol,  # EN: btol.
-                x_init=x_prev if i > 0 else None,  # EN: continuation (skip first).
-            )  # EN: End solve.
-            x_prev = rep.x_hat  # EN: Update continuation state.
-            warm_total_iters += int(rep.n_iters)  # EN: Add iterations.
-            warm_total_solve += float(rep.solve_seconds)  # EN: Add solve time.
+    # EN: Baseline CV: no warm-start; rand-QR is rebuilt from scratch for every damp.  # EN: Explain baseline.
+    print_separator("k-fold CV sweep (baseline): rebuild per damp, no warm-start")  # EN: Announce baseline section.
+    rng_cv_baseline = np.random.default_rng(SEED + 30)  # EN: Dedicated RNG stream for baseline.
+    baseline_rows: dict[str, tuple[str, float, float, float, float, int]] = {}  # EN: Map precond -> summary tuple.
 
-        speedup = float(cold_total_solve / max(warm_total_solve, EPS))  # EN: Compute solve-time speedup factor.
-        print(  # EN: Print one-line comparison for this preconditioner.
-            f"{pk:10} cold: iters={cold_total_iters:4d}, solve_s={cold_total_solve:.3f} | warm: iters={warm_total_iters:4d}, solve_s={warm_total_solve:.3f} | speedup={speedup:.2f}x"  # EN: Summary line.
+    for pk in preconds:  # EN: Run baseline CV for each preconditioner.
+        points, totals, best = cv_sweep_curve_sparse(  # EN: Run one full CV curve sweep.
+            splits=splits,  # EN: Provide splits.
+            A_full=A,  # EN: Provide full A.
+            b_full=b,  # EN: Provide full b.
+            damps=damps,  # EN: Provide damp grid.
+            precond_kind=pk,  # EN: Preconditioner kind.
+            randqr_policy="rebuild",  # EN: Baseline policy (ignored unless pk=="randqr").
+            warm_start=False,  # EN: No continuation.
+            max_iters=max_iters,  # EN: Iteration cap.
+            atol=atol,  # EN: atol.
+            btol=btol,  # EN: btol.
+            sketch_factor=sketch_factor,  # EN: Sketch factor for rand-QR.
+            rng=rng_cv_baseline,  # EN: RNG stream.
+        )  # EN: End sweep.
+
+        print_separator(f"CV results (baseline): {totals.precond}")  # EN: Announce per-preconditioner baseline results.
+        print_cv_table(points=points, best=best)  # EN: Print CV curve table.
+        total_seconds = float(totals.total_build_seconds + totals.total_solve_seconds)  # EN: Total curve cost.
+        print(  # EN: Print cost summary line.
+            f"\nTotal curve cost (baseline, {totals.precond}): build={totals.total_build_seconds:.3f}s, solve={totals.total_solve_seconds:.3f}s, total={total_seconds:.3f}s, iters={totals.total_iters}"  # EN: Summary string.
         )  # EN: End print.
+
+        baseline_rows[str(pk)] = (totals.precond, float(best.damp), float(best.val_mean), float(totals.total_build_seconds), float(totals.total_solve_seconds), int(totals.total_iters))  # EN: Store baseline summary.
+
+    print_separator("Baseline CV summary across preconditioners")  # EN: Announce baseline summary table.
+    header = "precond              | best_damp | best_val_rmse | build_s | solve_s | total_s | total_iters"  # EN: Header columns.
+    print(header)  # EN: Print header.
+    print("-" * len(header))  # EN: Divider.
+    for pk in preconds:  # EN: Print in consistent order.
+        label, best_d, best_val, build_s, solve_s, iters = baseline_rows[str(pk)]  # EN: Unpack baseline summary.
+        total_s = float(build_s + solve_s)  # EN: Total seconds.
+        damp_str = f"{best_d:.0e}" if best_d != 0.0 else "0"  # EN: Format damp.
+        print(f"{label:19} | {damp_str:9} | {best_val:13.3e} | {build_s:7.3f} | {solve_s:7.3f} | {total_s:7.3f} | {iters:10d}")  # EN: Print row.
+
+    # EN: Speedups: continuation (warm-start) + rand-QR shared sketch, to reduce full-curve CV cost.  # EN: Explain speedups.
+    print_separator("CV sweep speedups: warm-start + rand-QR shared sketch")  # EN: Announce speedup section.
+    rng_cv_speed = np.random.default_rng(SEED + 40)  # EN: Dedicated RNG stream for speedups.
+    speed_rows: dict[str, tuple[str, float, float, float, float, int]] = {}  # EN: Map precond -> summary tuple.
+
+    for pk in preconds:  # EN: Run speedup CV for each preconditioner.
+        policy = "shared_sketch" if pk == "randqr" else "rebuild"  # EN: Only rand-QR uses special reuse; others ignore policy.
+        points, totals, best = cv_sweep_curve_sparse(  # EN: Run CV sweep with speedups enabled.
+            splits=splits,  # EN: Provide splits.
+            A_full=A,  # EN: Provide full A.
+            b_full=b,  # EN: Provide full b.
+            damps=damps,  # EN: Provide damp grid.
+            precond_kind=pk,  # EN: Preconditioner kind.
+            randqr_policy=policy,  # EN: rand-QR reuse policy.
+            warm_start=True,  # EN: Enable continuation across damps.
+            max_iters=max_iters,  # EN: Iteration cap.
+            atol=atol,  # EN: atol.
+            btol=btol,  # EN: btol.
+            sketch_factor=sketch_factor,  # EN: Sketch factor.
+            rng=rng_cv_speed,  # EN: RNG stream.
+        )  # EN: End sweep.
+
+        total_seconds = float(totals.total_build_seconds + totals.total_solve_seconds)  # EN: Total curve cost.
+        damp_str = f"{best.damp:.0e}" if best.damp != 0.0 else "0"  # EN: Format best damp for printing.
+        print(  # EN: Print a compact summary line (baseline tables already printed above).
+            f"{totals.precond:22} best_damp={damp_str:>9} best_val={best.val_mean:.3e} total={total_seconds:.3f}s (build={totals.total_build_seconds:.3f}s, solve={totals.total_solve_seconds:.3f}s) iters={totals.total_iters}"  # EN: Summary string.
+        )  # EN: End print.
+
+        speed_rows[str(pk)] = (totals.precond, float(best.damp), float(best.val_mean), float(totals.total_build_seconds), float(totals.total_solve_seconds), int(totals.total_iters))  # EN: Store speed summary.
+
+    # EN: Compare baseline vs speedups in one table (time + iterations + best validation RMSE).  # EN: Explain comparison.
+    print_separator("Baseline vs speedups (time/iters/quality)")  # EN: Announce comparison table.
+    header = "precond              | base_total_s | sped_total_s | speedup | base_iters | sped_iters | base_best_val | sped_best_val"  # EN: Header columns.
+    print(header)  # EN: Print header.
+    print("-" * len(header))  # EN: Divider.
+    for pk in preconds:  # EN: Loop in consistent order.
+        b_label, _, b_best_val, b_build, b_solve, b_iters = baseline_rows[str(pk)]  # EN: Unpack baseline.
+        s_label, _, s_best_val, s_build, s_solve, s_iters = speed_rows[str(pk)]  # EN: Unpack speedup.
+        _ = s_label  # EN: Keep labels aligned; baseline label is shown in the first column.
+        base_total = float(b_build + b_solve)  # EN: Baseline total seconds.
+        sped_total = float(s_build + s_solve)  # EN: Speedup total seconds.
+        speedup = (base_total / max(sped_total, EPS))  # EN: Compute speedup factor.
+        print(  # EN: Print comparison row.
+            f"{b_label:19} | {base_total:11.3f} | {sped_total:11.3f} | {speedup:7.2f} | {b_iters:9d} | {s_iters:9d} | {b_best_val:12.3e} | {s_best_val:12.3e}"  # EN: Row.
+        )  # EN: End print.
+
+    # EN: Extra: for rand-QR, compare shared-sketch vs fixed-R reuse (both with warm-start).  # EN: Explain extra experiment.
+    print_separator("rand-QR reuse variants (warm-start): shared-sketch vs fixed-R")  # EN: Announce extra experiment.
+    rng_cv_fixed = np.random.default_rng(SEED + 50)  # EN: Separate RNG for fixed-R variant.
+    _points_fixed, totals_fixed, best_fixed = cv_sweep_curve_sparse(  # EN: Run fixed-R variant.
+        splits=splits,  # EN: Provide splits.
+        A_full=A,  # EN: Provide full A.
+        b_full=b,  # EN: Provide full b.
+        damps=damps,  # EN: Provide damp grid.
+        precond_kind="randqr",  # EN: rand-QR only.
+        randqr_policy="fixed_R",  # EN: Fixed-R reuse across the whole curve.
+        warm_start=True,  # EN: Continuation across damps.
+        max_iters=max_iters,  # EN: Iteration cap.
+        atol=atol,  # EN: atol.
+        btol=btol,  # EN: btol.
+        sketch_factor=sketch_factor,  # EN: Sketch factor.
+        rng=rng_cv_fixed,  # EN: RNG stream.
+    )  # EN: End sweep.
+    _ = _points_fixed  # EN: Keep points available for optional debugging.
+    total_fixed = float(totals_fixed.total_build_seconds + totals_fixed.total_solve_seconds)  # EN: Total seconds for fixed-R.
+    damp_str = f"{best_fixed.damp:.0e}" if best_fixed.damp != 0.0 else "0"  # EN: Format best damp for printing.
+    print(  # EN: Print fixed-R summary line.
+        f"{totals_fixed.precond:22} best_damp={damp_str:>9} best_val={best_fixed.val_mean:.3e} total={total_fixed:.3f}s (build={totals_fixed.total_build_seconds:.3f}s, solve={totals_fixed.total_solve_seconds:.3f}s) iters={totals_fixed.total_iters}"  # EN: Summary line.
+    )  # EN: End print.
 
 
 if __name__ == "__main__":  # EN: Standard Python entrypoint guard.

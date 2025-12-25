@@ -70,7 +70,7 @@
 - 進階預條件化（Randomized QR）：用 oversampled sketch `SA` 做 QR 取 `R` 當右預條件器（`x=R⁻¹y`），常能大幅降低 LSMR/LSQR 的迭代數。
 - Damped LSMR（Ridge）+ stopping + CV：把 LSMR 套到 `(AᵀA+damp²I)x=Aᵀb`，用 `‖Aᵀ(Ax-b)+damp²x‖` 做收斂驗收，並用 k-fold CV 選 `damp`。
 - Damped LSMR + 預條件化 + CV 總成本：在同一題比較 `none/col-scaling/rand-QR`，同時看 `iters`、`‖Ax-b‖`、`‖Aᵀr+damp²x‖`，以及掃完整條 `damp` 曲線的 `total_build_s/total_solve_s/total_iters`（更貼近 ML 調參成本）。
-- 稀疏 / matrix-free Ridge：用 CSR 形式保存 `A`，solver 僅用 `A@x`/`Aᵀ@y`（不形成 `AᵀA`），比較 `none` vs `col-scaling`，並用 continuation/warm-start 沿 `damp` 路徑降低迭代數（更貼近推薦系統/大規模稀疏回歸）。
+- 稀疏 / matrix-free Ridge：用 CSR 形式保存 `A`，solver 僅用 `A@x`/`Aᵀ@y`（不形成 `AᵀA`），比較 `none / col-scaling / rand-QR(CountSketch)`，用 `‖Aᵀ(Ax-b)+damp²x‖` 驗收；再用 k-fold CV 掃 `damp` 曲線並比較 `total_build_s/total_solve_s/total_iters`，最後用 continuation/warm-start + rand-QR reuse（shared sketch / fixed-R）把「掃 curve」的總成本壓下來（更貼近推薦系統/大規模稀疏回歸）。
 
 ---
 
