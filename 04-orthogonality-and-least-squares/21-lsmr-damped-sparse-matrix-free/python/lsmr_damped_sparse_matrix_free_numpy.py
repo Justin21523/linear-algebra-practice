@@ -41,6 +41,15 @@ class CSRMatrix:  # EN: Store CSR arrays needed for matvec and transpose-matvec.
     shape: tuple[int, int]  # EN: Matrix shape (m, n).
 
 
+@dataclass(frozen=True)  # EN: Immutable "view" of a CSR matrix restricted to a row subset (no CSR copying).
+class CSRRowSubset:  # EN: Represent A[row_ids, :] as an operator using only row indices and CSR pointers.
+    A: CSRMatrix  # EN: Reference to the full CSR matrix (data/indices/indptr are not copied).
+    row_ids: np.ndarray  # EN: Selected full-matrix row indices in the desired order (length m_subset).
+    starts: np.ndarray  # EN: Cached row start pointers indptr[row_ids] (length m_subset).
+    ends: np.ndarray  # EN: Cached row end pointers indptr[row_ids+1] (length m_subset).
+    shape: tuple[int, int]  # EN: Shape of the row-subset operator (m_subset, n).
+
+
 @dataclass(frozen=True)  # EN: Immutable container for a reusable CountSketch of the augmented matrix [A; damp I].
 class CountSketchAug:  # EN: Store SA_top plus the identity-row hashing so SA_aug(damp) can be formed cheaply.
     SA_top: np.ndarray  # EN: Dense sketch of the data block, SA_top = S_top A (shape s×n).
@@ -204,6 +213,78 @@ def csr_column_norms_sq(A: CSRMatrix) -> np.ndarray:  # EN: Compute column squar
     return col_sq  # EN: Return column squared norms.
 
 
+def make_csr_row_subset(A: CSRMatrix, row_ids: np.ndarray) -> CSRRowSubset:  # EN: Create a CSRRowSubset view A[row_ids, :] without copying CSR data.
+    m_full, n = A.shape  # EN: Extract full matrix dimensions.
+    rows = np.asarray(row_ids, dtype=int).reshape(-1)  # EN: Convert row ids to a 1D int array.
+    if rows.size == 0:  # EN: Handle empty selection.
+        empty = np.array([], dtype=int)  # EN: Create an empty int array.
+        return CSRRowSubset(A=A, row_ids=empty, starts=empty, ends=empty, shape=(0, int(n)))  # EN: Return an empty subset view.
+    if np.any(rows < 0) or np.any(rows >= int(m_full)):  # EN: Validate bounds.
+        raise ValueError("row_ids out of bounds")  # EN: Reject invalid row indices.
+    starts = np.asarray(A.indptr[rows], dtype=int).reshape(-1)  # EN: Cache row start pointers for each selected row.
+    ends = np.asarray(A.indptr[rows + 1], dtype=int).reshape(-1)  # EN: Cache row end pointers for each selected row.
+    return CSRRowSubset(A=A, row_ids=rows, starts=starts, ends=ends, shape=(int(rows.size), int(n)))  # EN: Return subset view.
+
+
+def csr_matvec_subset(subset: CSRRowSubset, x: np.ndarray) -> np.ndarray:  # EN: Compute y = A[row_ids,:] x using only CSR pointers and row indices.
+    A = subset.A  # EN: Unpack the full CSR matrix reference.
+    _, n = A.shape  # EN: Extract feature dimension.
+    x1 = np.asarray(x, dtype=float).reshape(-1)  # EN: Convert x to 1D float array.
+    if x1.size != int(n):  # EN: Validate x length.
+        raise ValueError("x has incompatible dimension")  # EN: Reject dimension mismatch.
+    m_subset = int(subset.shape[0])  # EN: Number of selected rows.
+    y = np.zeros((m_subset,), dtype=float)  # EN: Allocate output vector for the selected rows.
+    for k in range(m_subset):  # EN: Loop selected rows in the requested order.
+        start = int(subset.starts[k])  # EN: Row start pointer in the full CSR arrays.
+        end = int(subset.ends[k])  # EN: Row end pointer in the full CSR arrays.
+        if end <= start:  # EN: Skip empty rows.
+            continue  # EN: Move to next row.
+        cols = A.indices[start:end]  # EN: Column indices for this row segment (view into full arrays).
+        vals = A.data[start:end]  # EN: Nonzero values for this row segment (view into full arrays).
+        y[k] = float(np.dot(vals, x1[cols]))  # EN: Dot product of the sparse row with x.
+    return y.astype(float)  # EN: Return y as float.
+
+
+def csr_rmatvec_subset(subset: CSRRowSubset, y: np.ndarray) -> np.ndarray:  # EN: Compute x = A[row_ids,:]^T y using only CSR pointers and row indices.
+    A = subset.A  # EN: Unpack the full CSR matrix reference.
+    m_subset, n = subset.shape  # EN: Extract subset dimensions.
+    y1 = np.asarray(y, dtype=float).reshape(-1)  # EN: Convert y to 1D float array.
+    if y1.size != int(m_subset):  # EN: Validate y length against subset row count.
+        raise ValueError("y has incompatible dimension")  # EN: Reject dimension mismatch.
+    x = np.zeros((int(n),), dtype=float)  # EN: Allocate output vector in R^n.
+    for k in range(int(m_subset)):  # EN: Loop selected rows.
+        weight = float(y1[k])  # EN: Scalar weight for this row in the transpose product.
+        if weight == 0.0:  # EN: Skip work when y[k] is zero.
+            continue  # EN: Move to next row.
+        start = int(subset.starts[k])  # EN: Row start pointer.
+        end = int(subset.ends[k])  # EN: Row end pointer.
+        if end <= start:  # EN: Skip empty rows.
+            continue  # EN: Move to next row.
+        cols = A.indices[start:end]  # EN: Column indices for the row segment.
+        vals = A.data[start:end]  # EN: Nonzero values for the row segment.
+        np.add.at(x, cols, vals * weight)  # EN: Accumulate v_ij * y_k into x_j.
+    return x.astype(float)  # EN: Return x as float.
+
+
+def csr_column_norms_sq_and_fro_sq_subset(subset: CSRRowSubset) -> tuple[np.ndarray, float]:  # EN: Compute col norms and Frobenius^2 for A[row_ids,:] without copying CSR.
+    A = subset.A  # EN: Unpack full CSR matrix reference.
+    _, n = A.shape  # EN: Extract feature dimension.
+    col_sq = np.zeros((int(n),), dtype=float)  # EN: Allocate accumulator for column squared norms.
+    fro_sq = 0.0  # EN: Accumulate Frobenius norm squared over selected rows.
+    m_subset = int(subset.shape[0])  # EN: Selected row count.
+    for k in range(m_subset):  # EN: Loop selected rows.
+        start = int(subset.starts[k])  # EN: Row start pointer.
+        end = int(subset.ends[k])  # EN: Row end pointer.
+        if end <= start:  # EN: Skip empty rows.
+            continue  # EN: Move to next row.
+        cols = A.indices[start:end]  # EN: Column indices for the row segment.
+        vals = A.data[start:end]  # EN: Values for the row segment.
+        sq = vals * vals  # EN: Square values (contributes to both fro_sq and col_sq).
+        fro_sq += float(np.sum(sq))  # EN: Add row contribution to ||A||_F^2.
+        np.add.at(col_sq, cols, sq)  # EN: Add squared values into corresponding columns.
+    return col_sq.astype(float), float(fro_sq)  # EN: Return (col_sq, fro_sq).
+
+
 def csr_select_rows(A: CSRMatrix, row_ids: np.ndarray) -> CSRMatrix:  # EN: Build a CSR submatrix consisting of selected rows (in the given order).
     m, n = A.shape  # EN: Extract original shape.
     rows = np.asarray(row_ids, dtype=int).reshape(-1)  # EN: Convert row ids to a 1D int array.
@@ -296,6 +377,47 @@ def build_countsketch_aug(  # EN: Build a CountSketch for the augmented matrix [
     )  # EN: End return.
 
 
+def build_countsketch_aug_subset(  # EN: Build a CountSketch for [A[row_ids,:]; damp I] without copying CSR rows.
+    subset: CSRRowSubset,  # EN: Row-subset view (A[row_ids,:]) to sketch.
+    sketch_factor: float,  # EN: Oversampling factor for sketch rows (e.g., 4.0 => s≈4n).
+    rng: np.random.Generator,  # EN: RNG for sketch construction.
+) -> CountSketchAug:  # EN: Return CountSketchAug with SA_top and identity hashing.
+    A = subset.A  # EN: Unpack full CSR matrix reference.
+    m_sub, n = subset.shape  # EN: Extract subset dimensions.
+    m_aug = int(int(m_sub) + int(n))  # EN: Augmented row count for [A_sub; damp I].
+    s = choose_sketch_rows(m_aug=m_aug, n=int(n), sketch_factor=float(sketch_factor))  # EN: Choose sketch row count.
+    scale = float(1.0 / np.sqrt(max(s, 1)))  # EN: Use 1/sqrt(s) scaling (keeps norms comparable).
+
+    # EN: For the subset operator, "top" hashing is per subset-row (k=0..m_sub-1), not per full row id.  # EN: Explain mapping.
+    h_top = rng.integers(low=0, high=s, size=int(m_sub), dtype=int)  # EN: Hash bucket for each selected data row.
+    sign_top = rng.choice(np.array([-1.0, 1.0]), size=int(m_sub)).astype(float)  # EN: Random sign for each selected data row.
+
+    h_bottom = rng.integers(low=0, high=s, size=int(n), dtype=int)  # EN: Hash bucket for each identity row (one per feature).
+    sign_bottom = rng.choice(np.array([-1.0, 1.0]), size=int(n)).astype(float)  # EN: Random sign for each identity row.
+
+    SA_top = np.zeros((int(s), int(n)), dtype=float)  # EN: Allocate dense sketch matrix for S_top A_sub.
+
+    # EN: Compute SA_top = S_top A_sub in O(nnz_selected) by scanning only the selected CSR rows.  # EN: Explain loop.
+    for k in range(int(m_sub)):  # EN: Loop subset rows (in subset order).
+        row_bucket = int(h_top[k])  # EN: Sketch row index for this subset row.
+        row_sign = float(sign_top[k])  # EN: Random sign for this subset row.
+        start = int(subset.starts[k])  # EN: Row start pointer in full CSR arrays.
+        end = int(subset.ends[k])  # EN: Row end pointer in full CSR arrays.
+        if end <= start:  # EN: Skip empty rows.
+            continue  # EN: Move to next row.
+        cols = A.indices[start:end]  # EN: Column indices for this row segment.
+        vals = A.data[start:end]  # EN: Nonzero values for this row segment.
+        SA_top[row_bucket, cols] += (scale * row_sign) * vals  # EN: Add signed row into the sketch.
+
+    return CountSketchAug(  # EN: Return sketch container.
+        SA_top=SA_top.astype(float),  # EN: Store SA_top.
+        h_bottom=h_bottom.astype(int),  # EN: Store identity hashes.
+        sign_bottom=sign_bottom.astype(float),  # EN: Store identity signs.
+        scale=float(scale),  # EN: Store scaling factor.
+        s=int(s),  # EN: Store sketch row count.
+    )  # EN: End return.
+
+
 def randqr_R_from_countsketch(sketch: CountSketchAug, damp: float) -> np.ndarray:  # EN: Compute R from QR(S [A; damp I]) using a prebuilt CountSketch.
     n = int(sketch.SA_top.shape[1])  # EN: Extract n from SA_top.
     A_sketch = sketch.SA_top.copy()  # EN: Start from S_top A (data contribution).
@@ -332,7 +454,7 @@ def upper_triangular_preconditioner_from_R(  # EN: Create right-preconditioner a
 
 def build_preconditioner(  # EN: Build a right preconditioner for the sparse operator (none / col-scaling / rand-QR).
     kind: PrecondKind,  # EN: Preconditioner kind.
-    A: CSRMatrix,  # EN: Sparse design matrix (needed for rand-QR).
+    A: CSRMatrix | None,  # EN: Sparse design matrix (needed only for rand-QR; may be None for none/col).
     col_sq: np.ndarray,  # EN: Column squared norms of A (used by col-scaling).
     damp: float,  # EN: Damping parameter (affects augmented column norms and rand-QR).
     rng: np.random.Generator,  # EN: RNG for randomized preconditioners (ignored for deterministic kinds).
@@ -367,6 +489,8 @@ def build_preconditioner(  # EN: Build a right preconditioner for the sparse ope
         return label, apply_Minv, apply_Minv_T, build_seconds  # EN: Return preconditioner and timing.
 
     if kind == "randqr":  # EN: Randomized QR preconditioner built from a CountSketch of the augmented matrix.
+        if A is None:  # EN: rand-QR needs access to the CSR rows to build a sketch.
+            raise ValueError("A must be provided when kind='randqr'")  # EN: Fail fast on missing A.
         t0 = perf_counter()  # EN: Start build timer.
         sketch = build_countsketch_aug(A=A, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch blocks for this matrix.
         R = randqr_R_from_countsketch(sketch=sketch, damp=float(damp))  # EN: Build R from QR of the sketched augmented matrix.
@@ -527,8 +651,9 @@ def lsmr_damped_minres_teaching_operator(  # EN: Teaching LSMR for ridge using o
     return x_hat, int(n_done), stop_reason, float(rnorm_data_final), float(grad_norm_final), float(xnorm_final), float(rnorm_aug_final)  # EN: Return final values.
 
 
-def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-started) and return a SolveReport.
-    A: CSRMatrix,  # EN: Sparse design matrix in CSR.
+def solve_one_operator(  # EN: Solve one ridge problem given only matvecs (matrix-free), returning a SolveReport.
+    m: int,  # EN: Row dimension of the operator A (number of samples).
+    n: int,  # EN: Column dimension of the operator A (number of features).
     matvec_A: Matvec,  # EN: Matvec for A.
     matvec_AT: Matvec,  # EN: Matvec for A^T.
     col_sq: np.ndarray,  # EN: Column squared norms of A (precomputed once).
@@ -543,18 +668,20 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
     x_init: np.ndarray | None = None,  # EN: Optional warm-start initial guess in x-space.
     precond_override: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None,  # EN: Optional prebuilt (label, Minv, Minv_T).
     build_seconds_override: float | None = None,  # EN: Optional build-time override (used when precond_override is provided).
+    A_for_precond: CSRMatrix | None = None,  # EN: Optional CSR matrix for building rand-QR internally (not needed when precond_override is provided).
 ) -> SolveReport:  # EN: Return structured diagnostics for this run.
-    m, n = A.shape  # EN: Extract dimensions.
+    m_i = int(m)  # EN: Ensure m is an int.
+    n_i = int(n)  # EN: Ensure n is an int.
     damp_f = float(damp)  # EN: Ensure damp is a float.
 
     # EN: Use a deterministic upper bound for ||A_aug||_2 via Frobenius: ||A_aug||_2 <= ||A_aug||_F.  # EN: Explain estimate choice.
-    anorm_est = float(np.sqrt(float(fro_sq) + (damp_f * damp_f) * float(n)))  # EN: Compute ||[A;damp I]||_F.
+    anorm_est = float(np.sqrt(float(fro_sq) + (damp_f * damp_f) * float(n_i)))  # EN: Compute ||[A;damp I]||_F.
 
     # EN: Choose the preconditioner: either build it here, or reuse a prebuilt one supplied by the caller.  # EN: Explain override.
     if precond_override is None:  # EN: Default behavior: build preconditioner per call.
         label, apply_Minv, apply_Minv_T, build_seconds = build_preconditioner(  # EN: Build preconditioner.
             kind=precond_kind,  # EN: Preconditioner kind.
-            A=A,  # EN: Provide sparse matrix A (used by rand-QR).
+            A=A_for_precond,  # EN: Provide CSR rows only when needed (rand-QR); None is OK for none/col.
             col_sq=col_sq,  # EN: Provide column norms (used by col-scaling).
             damp=damp_f,  # EN: Provide damp.
             rng=rng,  # EN: Provide RNG.
@@ -565,12 +692,12 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
 
     # EN: Warm-start via a correction solve with RHS [b-Ax0; -damp x0].  # EN: Explain technique.
     if x_init is None:  # EN: No warm-start.
-        x0 = np.zeros((n,), dtype=float)  # EN: Use x0=0.
+        x0 = np.zeros((n_i,), dtype=float)  # EN: Use x0=0.
         b_top = np.asarray(b, dtype=float).reshape(-1)  # EN: Top RHS is original b.
         b_bottom = None  # EN: Bottom RHS is zero by default.
     else:  # EN: Warm-start enabled.
         x0 = np.asarray(x_init, dtype=float).reshape(-1)  # EN: Convert x_init to 1D float array.
-        if x0.size != n:  # EN: Validate x_init length.
+        if x0.size != n_i:  # EN: Validate x_init length.
             raise ValueError("x_init must have length n")  # EN: Reject invalid warm-start.
         b_top = np.asarray(b, dtype=float).reshape(-1) - matvec_A(x0)  # EN: Top RHS becomes residual b - A x0.
         b_bottom = -damp_f * x0  # EN: Bottom RHS becomes -damp x0.
@@ -579,8 +706,8 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
     x_delta, iters, stop_reason, _, _, _, _ = lsmr_damped_minres_teaching_operator(  # EN: Solve for delta (or x when x0=0).
         matvec_A=matvec_A,  # EN: Provide matvec A.
         matvec_AT=matvec_AT,  # EN: Provide matvec A^T.
-        m=int(m),  # EN: Provide m.
-        n=int(n),  # EN: Provide n.
+        m=int(m_i),  # EN: Provide m.
+        n=int(n_i),  # EN: Provide n.
         b=b_top,  # EN: Provide top RHS.
         damp=damp_f,  # EN: Provide damp.
         apply_Minv=apply_Minv,  # EN: Provide M^{-1}.
@@ -609,6 +736,45 @@ def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-sta
         xnorm=float(l2_norm(x_hat)),  # EN: ||x||.
         x_hat=x_hat,  # EN: Store solution for warm-start.
     )  # EN: End report.
+
+
+def solve_one_sparse(  # EN: Solve one sparse ridge problem (optionally warm-started) and return a SolveReport.
+    A: CSRMatrix,  # EN: Sparse design matrix in CSR.
+    matvec_A: Matvec,  # EN: Matvec for A.
+    matvec_AT: Matvec,  # EN: Matvec for A^T.
+    col_sq: np.ndarray,  # EN: Column squared norms of A (precomputed once).
+    fro_sq: float,  # EN: Frobenius norm squared of A (precomputed once).
+    b: np.ndarray,  # EN: RHS targets (length m).
+    damp: float,  # EN: Damping parameter.
+    precond_kind: PrecondKind,  # EN: Preconditioner kind.
+    max_iters: int,  # EN: Iteration cap.
+    atol: float,  # EN: Absolute tolerance.
+    btol: float,  # EN: Relative tolerance.
+    rng: np.random.Generator,  # EN: RNG for randomized preconditioners (rand-QR).
+    x_init: np.ndarray | None = None,  # EN: Optional warm-start initial guess in x-space.
+    precond_override: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None,  # EN: Optional prebuilt (label, Minv, Minv_T).
+    build_seconds_override: float | None = None,  # EN: Optional build-time override (used when precond_override is provided).
+) -> SolveReport:  # EN: Return structured diagnostics for this run.
+    m, n = A.shape  # EN: Extract dimensions from the CSR matrix.
+    return solve_one_operator(  # EN: Delegate to the matrix-free solver core.
+        m=int(m),  # EN: Row count.
+        n=int(n),  # EN: Feature count.
+        matvec_A=matvec_A,  # EN: Matvec A.
+        matvec_AT=matvec_AT,  # EN: Matvec A^T.
+        col_sq=col_sq,  # EN: Column norms.
+        fro_sq=float(fro_sq),  # EN: Frobenius squared.
+        b=b,  # EN: Targets.
+        damp=float(damp),  # EN: Damp.
+        precond_kind=precond_kind,  # EN: Preconditioner kind.
+        max_iters=max_iters,  # EN: Iteration cap.
+        atol=atol,  # EN: atol.
+        btol=btol,  # EN: btol.
+        rng=rng,  # EN: RNG.
+        x_init=x_init,  # EN: Warm-start (optional).
+        precond_override=precond_override,  # EN: Optional prebuilt preconditioner.
+        build_seconds_override=build_seconds_override,  # EN: Optional build-time override.
+        A_for_precond=A,  # EN: Provide CSR rows for internal rand-QR builds when needed.
+    )  # EN: End delegation.
 
 
 def print_solver_table(reports: list[SolveReport]) -> None:  # EN: Print a compact solver comparison table.
@@ -712,22 +878,24 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
 
     damp_ref = choose_fixed_randqr_reference_damp(damps_sorted)  # EN: Reference damp for fixed-R policy.
 
+    b_full_1d = np.asarray(b_full, dtype=float).reshape(-1)  # EN: Normalize b_full to a 1D float array once.
+
     for fold_id, (train_idx, val_idx) in enumerate(splits):  # EN: Loop folds (outer) to enable continuation within each fold.
-        A_tr = csr_select_rows(A=A_full, row_ids=train_idx)  # EN: Build training CSR matrix.
-        b_tr = np.asarray(b_full, dtype=float).reshape(-1)[train_idx]  # EN: Slice training targets.
-        A_va = csr_select_rows(A=A_full, row_ids=val_idx)  # EN: Build validation CSR matrix.
-        b_va = np.asarray(b_full, dtype=float).reshape(-1)[val_idx]  # EN: Slice validation targets.
+        # EN: IMPORTANT: do NOT build A_tr/A_va as new CSR matrices; instead, keep A_full and use row-index operators.  # EN: Explain memory goal.
+        subset_tr = make_csr_row_subset(A=A_full, row_ids=train_idx)  # EN: Training operator view A_full[train_idx, :].
+        subset_va = make_csr_row_subset(A=A_full, row_ids=val_idx)  # EN: Validation operator view A_full[val_idx, :].
 
-        col_sq_tr = csr_column_norms_sq(A_tr)  # EN: Column norms for training matrix (used by col-scaling).
-        fro_sq_tr = float(np.sum(A_tr.data * A_tr.data))  # EN: ||A_tr||_F^2 for norm bounds.
+        m_tr = int(subset_tr.shape[0])  # EN: Training sample count for this fold.
+        b_tr = b_full_1d[subset_tr.row_ids]  # EN: Slice training targets (aligned with subset order).
+        b_va = b_full_1d[subset_va.row_ids]  # EN: Slice validation targets (aligned with subset order).
 
-        row_idx_tr = np.repeat(np.arange(A_tr.shape[0], dtype=int), np.diff(A_tr.indptr).astype(int))  # EN: Precompute row index per nnz for A_tr^T matvec.
+        col_sq_tr, fro_sq_tr = csr_column_norms_sq_and_fro_sq_subset(subset_tr)  # EN: Column norms + ||A_tr||_F^2 for norm bounds.
 
-        def matvec_A_tr(x: np.ndarray, A_tr: CSRMatrix = A_tr) -> np.ndarray:  # EN: Training matvec A_tr x.
-            return csr_matvec(A=A_tr, x=x)  # EN: Compute A_tr x.
+        def matvec_A_tr(x: np.ndarray, subset_tr: CSRRowSubset = subset_tr) -> np.ndarray:  # EN: Training matvec A_tr x.
+            return csr_matvec_subset(subset=subset_tr, x=x)  # EN: Compute A_full[train_idx,:] x.
 
-        def matvec_AT_tr(y: np.ndarray, A_tr: CSRMatrix = A_tr, row_idx_tr: np.ndarray = row_idx_tr) -> np.ndarray:  # EN: Training transpose matvec A_tr^T y.
-            return csr_rmatvec(A=A_tr, y=y, row_indices=row_idx_tr)  # EN: Compute A_tr^T y.
+        def matvec_AT_tr(y: np.ndarray, subset_tr: CSRRowSubset = subset_tr) -> np.ndarray:  # EN: Training transpose matvec A_tr^T y.
+            return csr_rmatvec_subset(subset=subset_tr, y=y)  # EN: Compute A_full[train_idx,:]^T y.
 
         x_prev = np.zeros((n_features,), dtype=float)  # EN: Initialize continuation with x=0 for the first step.
 
@@ -737,7 +905,7 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
 
         if precond_kind == "randqr" and randqr_policy in {"shared_sketch", "fixed_R"}:  # EN: Build shared CountSketch once per fold.
             t0 = perf_counter()  # EN: Start sketch build timer.
-            shared_sketch = build_countsketch_aug(A=A_tr, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch blocks.
+            shared_sketch = build_countsketch_aug_subset(subset=subset_tr, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch blocks from selected rows.
             total_build += float(perf_counter() - t0)  # EN: Account for one-time sketch build cost.
 
         if precond_kind == "randqr" and randqr_policy == "fixed_R":  # EN: Build a fixed R once per fold (then reuse across all damps).
@@ -753,13 +921,14 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
             x_init = x_prev if (warm_start and step > 0) else None  # EN: Use previous x as warm-start except for the first step.
 
             # EN: Choose how to build/reuse the preconditioner for this fit.  # EN: Explain branching.
-            if precond_kind != "randqr":  # EN: Non-randQR paths use the standard builder inside solve_one_sparse.
-                rep = solve_one_sparse(  # EN: Fit on the training fold.
-                    A=A_tr,  # EN: Training A.
+            if precond_kind != "randqr":  # EN: None/col use internal builders that do not require CSR copying.
+                rep = solve_one_operator(  # EN: Fit on the training fold with matrix-free operators.
+                    m=int(m_tr),  # EN: Training row count.
+                    n=int(n_features),  # EN: Feature count.
                     matvec_A=matvec_A_tr,  # EN: Training matvec A.
                     matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
-                    col_sq=col_sq_tr,  # EN: Column norms for training A.
-                    fro_sq=fro_sq_tr,  # EN: Frobenius squared for training A.
+                    col_sq=col_sq_tr,  # EN: Column norms for training operator.
+                    fro_sq=float(fro_sq_tr),  # EN: Frobenius squared for norm bound.
                     b=b_tr,  # EN: Training targets.
                     damp=float(damp),  # EN: Damp.
                     precond_kind=precond_kind,  # EN: Preconditioner kind.
@@ -768,23 +937,33 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
                     btol=btol,  # EN: btol.
                     rng=rng,  # EN: RNG (unused by deterministic kinds).
                     x_init=x_init,  # EN: Warm-start (optional).
+                    A_for_precond=None,  # EN: No CSR needed for none/col builds.
                 )  # EN: End solve.
             else:  # EN: rand-QR path supports rebuild/shared/fixed policies.
                 if randqr_policy == "rebuild":  # EN: Baseline: rebuild sketch and QR for every damp.
-                    rep = solve_one_sparse(  # EN: Fit with per-call rand-QR build.
-                        A=A_tr,  # EN: Training A.
+                    t0 = perf_counter()  # EN: Time sketch+QR build for baseline rebuild.
+                    sketch = build_countsketch_aug_subset(subset=subset_tr, sketch_factor=float(sketch_factor), rng=rng)  # EN: Build CountSketch from selected rows.
+                    R = randqr_R_from_countsketch(sketch=sketch, damp=float(damp))  # EN: Build R from QR of the sketched augmented matrix.
+                    build_s = float(perf_counter() - t0)  # EN: Total build time for rebuild policy.
+                    precond = upper_triangular_preconditioner_from_R(R=R, label="rand-QR(rebuild)")  # EN: Create apply closures from R.
+                    rep = solve_one_operator(  # EN: Fit with externally built rand-QR preconditioner.
+                        m=int(m_tr),  # EN: Training row count.
+                        n=int(n_features),  # EN: Feature count.
                         matvec_A=matvec_A_tr,  # EN: Training matvec A.
                         matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
-                        col_sq=col_sq_tr,  # EN: Column norms.
-                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        col_sq=col_sq_tr,  # EN: Column norms (still used for metadata / consistency).
+                        fro_sq=float(fro_sq_tr),  # EN: Frobenius squared.
                         b=b_tr,  # EN: Training targets.
                         damp=float(damp),  # EN: Damp.
-                        precond_kind="randqr",  # EN: rand-QR.
+                        precond_kind="randqr",  # EN: Kind ignored because we pass precond_override.
                         max_iters=max_iters,  # EN: Cap.
                         atol=atol,  # EN: atol.
                         btol=btol,  # EN: btol.
-                        rng=rng,  # EN: RNG (used by rand-QR rebuild).
+                        rng=rng,  # EN: RNG (unused due to override).
                         x_init=x_init,  # EN: Warm-start (optional).
+                        precond_override=precond,  # EN: Use the prebuilt preconditioner closures.
+                        build_seconds_override=build_s,  # EN: Charge full build time for this fit.
+                        A_for_precond=None,  # EN: No CSR needed because precond_override is used.
                     )  # EN: End solve.
                 elif randqr_policy == "shared_sketch":  # EN: Rebuild R per damp, but reuse the expensive sketch SA_top.
                     if shared_sketch is None:  # EN: Defensive check.
@@ -793,12 +972,13 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
                     R = randqr_R_from_countsketch(sketch=shared_sketch, damp=float(damp))  # EN: Build R using shared sketch.
                     build_s = float(perf_counter() - t0)  # EN: Record per-damp QR build time.
                     precond = upper_triangular_preconditioner_from_R(R=R, label="rand-QR(shared)")  # EN: Create apply closures from R.
-                    rep = solve_one_sparse(  # EN: Fit with an externally built preconditioner.
-                        A=A_tr,  # EN: Training A.
+                    rep = solve_one_operator(  # EN: Fit with an externally built preconditioner.
+                        m=int(m_tr),  # EN: Training row count.
+                        n=int(n_features),  # EN: Feature count.
                         matvec_A=matvec_A_tr,  # EN: Training matvec A.
                         matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
                         col_sq=col_sq_tr,  # EN: Column norms.
-                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        fro_sq=float(fro_sq_tr),  # EN: Frobenius squared.
                         b=b_tr,  # EN: Training targets.
                         damp=float(damp),  # EN: Damp.
                         precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
@@ -809,16 +989,18 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
                         x_init=x_init,  # EN: Warm-start (optional).
                         precond_override=precond,  # EN: Use the prebuilt preconditioner closures.
                         build_seconds_override=build_s,  # EN: Charge only QR time (sketch build charged once per fold above).
+                        A_for_precond=None,  # EN: No CSR needed because precond_override is used.
                     )  # EN: End solve.
                 elif randqr_policy == "fixed_R":  # EN: Reuse the SAME R preconditioner for all damp values in the curve.
                     if fixed_precond is None:  # EN: Defensive check.
                         raise RuntimeError("internal error: fixed_precond is None for fixed_R policy")  # EN: Fail fast.
-                    rep = solve_one_sparse(  # EN: Fit with the reused preconditioner.
-                        A=A_tr,  # EN: Training A.
+                    rep = solve_one_operator(  # EN: Fit with the reused preconditioner.
+                        m=int(m_tr),  # EN: Training row count.
+                        n=int(n_features),  # EN: Feature count.
                         matvec_A=matvec_A_tr,  # EN: Training matvec A.
                         matvec_AT=matvec_AT_tr,  # EN: Training matvec A^T.
                         col_sq=col_sq_tr,  # EN: Column norms.
-                        fro_sq=fro_sq_tr,  # EN: Frobenius squared.
+                        fro_sq=float(fro_sq_tr),  # EN: Frobenius squared.
                         b=b_tr,  # EN: Training targets.
                         damp=float(damp),  # EN: Damp (objective still changes, only M is fixed).
                         precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
@@ -829,16 +1011,18 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
                         x_init=x_init,  # EN: Warm-start (optional).
                         precond_override=fixed_precond,  # EN: Use the fixed-R preconditioner closures.
                         build_seconds_override=0.0,  # EN: No per-damp build cost when R is fixed.
+                        A_for_precond=None,  # EN: No CSR needed because precond_override is used.
                     )  # EN: End solve.
                 else:  # EN: Guard against unknown policy values.
                     raise ValueError("Unknown randqr_policy")  # EN: Reject invalid policy.
 
             x_prev = rep.x_hat  # EN: Update continuation state for the next damp (used only when warm_start=True).
 
-            train_pred = csr_matvec(A=A_tr, x=rep.x_hat)  # EN: Compute training predictions A_tr x_hat.
-            val_pred = csr_matvec(A=A_va, x=rep.x_hat)  # EN: Compute validation predictions A_va x_hat.
+            # EN: Training RMSE can be computed from ||A_tr x - b_tr||_2 without another matvec: RMSE = ||r||_2 / sqrt(m_tr).  # EN: Explain shortcut.
+            train_rmse = float(rep.rnorm_data) / float(np.sqrt(max(m_tr, 1)))  # EN: Compute train RMSE cheaply.
+            val_pred = csr_matvec_subset(subset=subset_va, x=rep.x_hat)  # EN: Compute validation predictions A_full[val_idx,:] x_hat.
 
-            train_rmse_mat[idx, fold_id] = rmse(y_true=b_tr, y_pred=train_pred)  # EN: Store train RMSE.
+            train_rmse_mat[idx, fold_id] = float(train_rmse)  # EN: Store train RMSE.
             val_rmse_mat[idx, fold_id] = rmse(y_true=b_va, y_pred=val_pred)  # EN: Store validation RMSE.
             xnorm_mat[idx, fold_id] = float(rep.xnorm)  # EN: Store ||x||.
             iters_mat[idx, fold_id] = float(rep.n_iters)  # EN: Store iterations.

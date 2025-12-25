@@ -8,6 +8,7 @@
 > - 比較 `none / col-scaling / rand-QR(CountSketch)` 三種右預條件化
 > - 做 **k-fold CV** 掃 `damp` 曲線，報告 `total_build_s / total_solve_s / total_iters`（整條曲線總成本）
 > - 示範「跑整條曲線做快」：continuation/warm-start + rand-QR 的 `shared sketch` / `fixed-R`
+> - CV folds **不再複製 CSR 子矩陣**：用 row-index 的 matrix-free matvec/rmatvec 直接在 `A_full` 上計算（更貼近超大 m）
 
 ## 本單元實作（Python）
 

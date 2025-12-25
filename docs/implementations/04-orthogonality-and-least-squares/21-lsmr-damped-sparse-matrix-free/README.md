@@ -108,6 +108,29 @@ CV 的品質部分，則是用：
 - `train_rmse(mean±std)`：訓練集 RMSE（跨 folds 的平均與標準差）
 - `val_rmse(mean±std)`：驗證集 RMSE（跨 folds 的平均與標準差）
 
+### CV fold 不複製 CSR：row-index 的 matrix-free operator
+
+這一版的單元 21 刻意避免在每個 fold 建 `A_tr/A_va` 的 CSR 子矩陣（那會複製 `data/indices/indptr`，在超大 `m` 時非常花記憶體與建表時間）。
+
+做法是保留一份 `A_full`（CSR），每個 fold 只存：
+
+- `train_idx / val_idx`（row indices）
+- 對應的 `indptr` 起訖指標（`starts/ends`，可視為「row pointers 的 cache」）
+
+然後把 `A_tr` / `A_va` 當成「只會做 matvec / rmatvec 的 operator」：
+
+- `matvec_A_tr(x) = A_full[train_idx,:] @ x`
+- `matvec_AT_tr(y) = A_full[train_idx,:]^T @ y`
+
+這樣你就能：
+
+- 不複製 CSR 非零資料（省記憶體）
+- 在同一份 `A_full` 上做 CV（更貼近真實大型管線）
+
+另外，train RMSE 也不用再多做一次 matvec：因為 solver 已經算了 `‖A_tr x_hat - b_tr‖_2`，所以：
+
+- `train_rmse = ‖A_tr x_hat - b_tr‖_2 / sqrt(m_tr)`
+
 ### sparse rand-QR（CountSketch）為什麼特別適合？
 
 在 dense 場景（單元 20），rand-QR 類預條件器常用「密集的隨機矩陣」做 sketch；但在 sparse 場景，你更想要：
@@ -149,6 +172,14 @@ for each row i:
   y[i] = dot(data[row], x[indices[row]])
 ```
 
+> CV fold 的 row-index operator（不建立 `A_tr/A_va` CSR 子矩陣；只存 row ids + indptr pointers）。
+
+```text
+subset_tr = make_row_subset(A_full, train_idx)
+y_tr = subset_tr @ x
+z = subset_tr.T @ y_tr
+```
+
 > warm-start 的等價 RHS（解增量 `delta`，最後合成 `x = x0 + delta`）。
 
 ```text
@@ -175,11 +206,12 @@ R = qr(A_sketch).R
 
 ```text
 for fold in folds:
-  build A_tr, A_va
+  subset_tr = operator(A_full, train_idx)   # row-index, no CSR copy
+  subset_va = operator(A_full, val_idx)     # row-index, no CSR copy
   maybe build shared_sketch (rand-QR only)
   for damp in damps:
     x_init = prev_x if warm_start else None
-    fit on A_tr, evaluate on A_va
+    fit on subset_tr, evaluate on subset_va
     accumulate total_build_s / total_solve_s / total_iters
 ```
 
