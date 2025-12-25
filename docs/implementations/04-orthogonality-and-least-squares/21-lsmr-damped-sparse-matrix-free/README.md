@@ -115,7 +115,7 @@ CV 的品質部分，則是用：
 做法是保留一份 `A_full`（CSR），每個 fold 只存：
 
 - `train_idx / val_idx`（row indices）
-- 對應的 `indptr` 起訖指標（`starts/ends`，可視為「row pointers 的 cache」）
+- （可選）對應的 `indptr` 起訖指標 cache（`starts/ends`）；在 `m` 超大時可關掉 cache 來省記憶體
 
 然後把 `A_tr` / `A_va` 當成「只會做 matvec / rmatvec 的 operator」：
 
@@ -126,6 +126,8 @@ CV 的品質部分，則是用：
 
 - 不複製 CSR 非零資料（省記憶體）
 - 在同一份 `A_full` 上做 CV（更貼近真實大型管線）
+
+本單元目前在 CV sweep 內預設 **不開 `starts/ends` cache**（用 `indptr[row]` 即時計算），避免在超大 fold 時多存兩個 O(m_fold) 的指標陣列。
 
 另外，train RMSE 也不用再多做一次 matvec：因為 solver 已經算了 `‖A_tr x_hat - b_tr‖_2`，所以：
 

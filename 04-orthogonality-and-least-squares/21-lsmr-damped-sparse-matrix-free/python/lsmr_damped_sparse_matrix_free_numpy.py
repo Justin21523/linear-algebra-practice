@@ -45,8 +45,8 @@ class CSRMatrix:  # EN: Store CSR arrays needed for matvec and transpose-matvec.
 class CSRRowSubset:  # EN: Represent A[row_ids, :] as an operator using only row indices and CSR pointers.
     A: CSRMatrix  # EN: Reference to the full CSR matrix (data/indices/indptr are not copied).
     row_ids: np.ndarray  # EN: Selected full-matrix row indices in the desired order (length m_subset).
-    starts: np.ndarray  # EN: Cached row start pointers indptr[row_ids] (length m_subset).
-    ends: np.ndarray  # EN: Cached row end pointers indptr[row_ids+1] (length m_subset).
+    starts: np.ndarray | None  # EN: Optional cached row start pointers indptr[row_ids] (length m_subset).
+    ends: np.ndarray | None  # EN: Optional cached row end pointers indptr[row_ids+1] (length m_subset).
     shape: tuple[int, int]  # EN: Shape of the row-subset operator (m_subset, n).
 
 
@@ -213,16 +213,28 @@ def csr_column_norms_sq(A: CSRMatrix) -> np.ndarray:  # EN: Compute column squar
     return col_sq  # EN: Return column squared norms.
 
 
-def make_csr_row_subset(A: CSRMatrix, row_ids: np.ndarray) -> CSRRowSubset:  # EN: Create a CSRRowSubset view A[row_ids, :] without copying CSR data.
+def make_csr_row_subset(  # EN: Create a CSRRowSubset view A[row_ids, :] without copying CSR data.
+    A: CSRMatrix,  # EN: Full CSR matrix reference.
+    row_ids: np.ndarray,  # EN: Selected row indices (any order).
+    cache_pointers: bool = True,  # EN: Whether to cache starts/ends pointers (saves CPU, costs O(m_subset) memory).
+) -> CSRRowSubset:  # EN: Return a subset operator view.
     m_full, n = A.shape  # EN: Extract full matrix dimensions.
-    rows = np.asarray(row_ids, dtype=int).reshape(-1)  # EN: Convert row ids to a 1D int array.
+    # EN: Store row ids as int32 when possible to reduce memory for huge m (safe as long as m fits in int32).  # EN: Explain dtype choice.
+    row_dtype = np.int32 if int(m_full) <= int(np.iinfo(np.int32).max) else np.int64  # EN: Pick smallest safe integer dtype for row ids.
+    rows = np.asarray(row_ids, dtype=row_dtype).reshape(-1)  # EN: Convert row ids to a 1D int array with chosen dtype.
     if rows.size == 0:  # EN: Handle empty selection.
-        empty = np.array([], dtype=int)  # EN: Create an empty int array.
-        return CSRRowSubset(A=A, row_ids=empty, starts=empty, ends=empty, shape=(0, int(n)))  # EN: Return an empty subset view.
+        empty_rows = np.array([], dtype=row_dtype)  # EN: Create an empty row-id array.
+        return CSRRowSubset(A=A, row_ids=empty_rows, starts=None, ends=None, shape=(0, int(n)))  # EN: Return an empty subset view.
     if np.any(rows < 0) or np.any(rows >= int(m_full)):  # EN: Validate bounds.
         raise ValueError("row_ids out of bounds")  # EN: Reject invalid row indices.
-    starts = np.asarray(A.indptr[rows], dtype=int).reshape(-1)  # EN: Cache row start pointers for each selected row.
-    ends = np.asarray(A.indptr[rows + 1], dtype=int).reshape(-1)  # EN: Cache row end pointers for each selected row.
+
+    if cache_pointers:  # EN: Optionally cache indptr pointers for faster repeated matvec/rmatvec.
+        starts = np.asarray(A.indptr[rows], dtype=int).reshape(-1)  # EN: Cache row start pointers indptr[row].
+        ends = np.asarray(A.indptr[(rows + 1)], dtype=int).reshape(-1)  # EN: Cache row end pointers indptr[row+1].
+    else:  # EN: Skip caching to minimize memory for very large folds.
+        starts = None  # EN: No cached starts.
+        ends = None  # EN: No cached ends.
+
     return CSRRowSubset(A=A, row_ids=rows, starts=starts, ends=ends, shape=(int(rows.size), int(n)))  # EN: Return subset view.
 
 
@@ -235,8 +247,13 @@ def csr_matvec_subset(subset: CSRRowSubset, x: np.ndarray) -> np.ndarray:  # EN:
     m_subset = int(subset.shape[0])  # EN: Number of selected rows.
     y = np.zeros((m_subset,), dtype=float)  # EN: Allocate output vector for the selected rows.
     for k in range(m_subset):  # EN: Loop selected rows in the requested order.
-        start = int(subset.starts[k])  # EN: Row start pointer in the full CSR arrays.
-        end = int(subset.ends[k])  # EN: Row end pointer in the full CSR arrays.
+        row_id = int(subset.row_ids[k])  # EN: Full-matrix row index for this subset row.
+        if subset.starts is not None and subset.ends is not None:  # EN: Use cached pointers when available.
+            start = int(subset.starts[k])  # EN: Cached row start pointer.
+            end = int(subset.ends[k])  # EN: Cached row end pointer.
+        else:  # EN: Compute pointers on the fly to save memory.
+            start = int(A.indptr[row_id])  # EN: Row start pointer indptr[row_id].
+            end = int(A.indptr[row_id + 1])  # EN: Row end pointer indptr[row_id+1].
         if end <= start:  # EN: Skip empty rows.
             continue  # EN: Move to next row.
         cols = A.indices[start:end]  # EN: Column indices for this row segment (view into full arrays).
@@ -256,8 +273,13 @@ def csr_rmatvec_subset(subset: CSRRowSubset, y: np.ndarray) -> np.ndarray:  # EN
         weight = float(y1[k])  # EN: Scalar weight for this row in the transpose product.
         if weight == 0.0:  # EN: Skip work when y[k] is zero.
             continue  # EN: Move to next row.
-        start = int(subset.starts[k])  # EN: Row start pointer.
-        end = int(subset.ends[k])  # EN: Row end pointer.
+        row_id = int(subset.row_ids[k])  # EN: Full-matrix row index for this subset row.
+        if subset.starts is not None and subset.ends is not None:  # EN: Use cached pointers when available.
+            start = int(subset.starts[k])  # EN: Cached row start pointer.
+            end = int(subset.ends[k])  # EN: Cached row end pointer.
+        else:  # EN: Compute pointers on the fly to save memory.
+            start = int(A.indptr[row_id])  # EN: Row start pointer indptr[row_id].
+            end = int(A.indptr[row_id + 1])  # EN: Row end pointer indptr[row_id+1].
         if end <= start:  # EN: Skip empty rows.
             continue  # EN: Move to next row.
         cols = A.indices[start:end]  # EN: Column indices for the row segment.
@@ -273,8 +295,13 @@ def csr_column_norms_sq_and_fro_sq_subset(subset: CSRRowSubset) -> tuple[np.ndar
     fro_sq = 0.0  # EN: Accumulate Frobenius norm squared over selected rows.
     m_subset = int(subset.shape[0])  # EN: Selected row count.
     for k in range(m_subset):  # EN: Loop selected rows.
-        start = int(subset.starts[k])  # EN: Row start pointer.
-        end = int(subset.ends[k])  # EN: Row end pointer.
+        row_id = int(subset.row_ids[k])  # EN: Full-matrix row index for this subset row.
+        if subset.starts is not None and subset.ends is not None:  # EN: Use cached pointers when available.
+            start = int(subset.starts[k])  # EN: Cached row start pointer.
+            end = int(subset.ends[k])  # EN: Cached row end pointer.
+        else:  # EN: Compute pointers on the fly to save memory.
+            start = int(A.indptr[row_id])  # EN: Row start pointer indptr[row_id].
+            end = int(A.indptr[row_id + 1])  # EN: Row end pointer indptr[row_id+1].
         if end <= start:  # EN: Skip empty rows.
             continue  # EN: Move to next row.
         cols = A.indices[start:end]  # EN: Column indices for the row segment.
@@ -401,8 +428,13 @@ def build_countsketch_aug_subset(  # EN: Build a CountSketch for [A[row_ids,:]; 
     for k in range(int(m_sub)):  # EN: Loop subset rows (in subset order).
         row_bucket = int(h_top[k])  # EN: Sketch row index for this subset row.
         row_sign = float(sign_top[k])  # EN: Random sign for this subset row.
-        start = int(subset.starts[k])  # EN: Row start pointer in full CSR arrays.
-        end = int(subset.ends[k])  # EN: Row end pointer in full CSR arrays.
+        row_id = int(subset.row_ids[k])  # EN: Full-matrix row index for this subset row.
+        if subset.starts is not None and subset.ends is not None:  # EN: Use cached pointers when available.
+            start = int(subset.starts[k])  # EN: Cached row start pointer.
+            end = int(subset.ends[k])  # EN: Cached row end pointer.
+        else:  # EN: Compute pointers on the fly to save memory.
+            start = int(A.indptr[row_id])  # EN: Row start pointer indptr[row_id].
+            end = int(A.indptr[row_id + 1])  # EN: Row end pointer indptr[row_id+1].
         if end <= start:  # EN: Skip empty rows.
             continue  # EN: Move to next row.
         cols = A.indices[start:end]  # EN: Column indices for this row segment.
@@ -882,8 +914,8 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
 
     for fold_id, (train_idx, val_idx) in enumerate(splits):  # EN: Loop folds (outer) to enable continuation within each fold.
         # EN: IMPORTANT: do NOT build A_tr/A_va as new CSR matrices; instead, keep A_full and use row-index operators.  # EN: Explain memory goal.
-        subset_tr = make_csr_row_subset(A=A_full, row_ids=train_idx)  # EN: Training operator view A_full[train_idx, :].
-        subset_va = make_csr_row_subset(A=A_full, row_ids=val_idx)  # EN: Validation operator view A_full[val_idx, :].
+        subset_tr = make_csr_row_subset(A=A_full, row_ids=train_idx, cache_pointers=False)  # EN: Training operator view A_full[train_idx, :] (no pointer cache to save memory).
+        subset_va = make_csr_row_subset(A=A_full, row_ids=val_idx, cache_pointers=False)  # EN: Validation operator view A_full[val_idx, :] (no pointer cache to save memory).
 
         m_tr = int(subset_tr.shape[0])  # EN: Training sample count for this fold.
         b_tr = b_full_1d[subset_tr.row_ids]  # EN: Slice training targets (aligned with subset order).
