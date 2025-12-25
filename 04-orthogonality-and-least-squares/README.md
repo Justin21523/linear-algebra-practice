@@ -35,6 +35,8 @@
 14-lsqr-damped-and-stopping-criteria/ Damped LSQR（Ridge）+ stopping criteria（更實務）
 15-lsqr-lsmr-preconditioning/      LSQR/LSMR 類方法的預條件化：column scaling（右預條件）
 16-damped-lsqr-damp-selection-cv/  用 k-fold CV 選 damp（Ridge λ=damp²）：更貼近 ML 超參數選擇
+17-lsmr-iterative-least-squares/   LSMR：normal equations 上的 MINRES（教學版）+ 與 LSQR 對照
+18-lsmr-advanced-preconditioning-randomized-qr/ 進階預條件化：Randomized QR（Blendenpik/LSRN 風格）加速 LSMR/LSQR
 ```
 
 ## 學習目標

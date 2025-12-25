@@ -66,6 +66,8 @@
 - 預條件化（LSQR/LSMR 類）：用右預條件 `x=D⁻¹y`（column scaling）把問題改成解 `min‖(A D⁻¹)y-b‖`，比較迭代數與 `‖Aᵀr‖`（通常會更快）。
 - 正則化最小平方（Damped LSQR）：把 `min(‖Ax-b‖² + damp²‖x‖²)` 改寫成擴增系統 `[A; damp I]`，並用 `atol/btol` 等 stopping criteria 驗收斂。
 - 超參數選擇（CV 選 damp）：對候選 `damp` 做 k-fold CV（mean±std），用 validation RMSE 的 U-shape 挑最佳 `damp`（等價 Ridge 的 `λ=damp²`）。
+- LSMR：可視為在 normal equations 上做 MINRES（但不形成 `AᵀA`），用 `‖Aᵀr‖` 作為核心收斂指標，並與 LSQR 比較迭代數/收斂行為。
+- 進階預條件化（Randomized QR）：用 oversampled sketch `SA` 做 QR 取 `R` 當右預條件器（`x=R⁻¹y`），常能大幅降低 LSMR/LSQR 的迭代數。
 
 ---
 
@@ -111,3 +113,4 @@
 - `07-svd/03-top-k-pca-block-power-deflation-lanczos/`（只求前 k 個主成分：block power / deflation / Lanczos）
 - `07-svd/04-randomized-svd/`（Randomized SVD：隨機投影做大型 top-k SVD/PCA 近似）
 - `07-svd/05-oja-online-pca/`（Oja’s online PCA：串流/小批次學主成分，觀察 learning rate 與 eigengap）
+- `07-svd/06-randomized-svd-vs-oja-benchmark/`（同資料對照：randSVD 的 p/q vs Oja 的 learning-rate，品質/成本表格）

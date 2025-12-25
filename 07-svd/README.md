@@ -23,4 +23,5 @@ SVD 的重點不只是「算出來」，而是理解：
 03-top-k-pca-block-power-deflation-lanczos/ Top-k PCA：block power / deflation / Lanczos（只求前 k 個主成分）
 04-randomized-svd/ Randomized SVD：隨機投影 + 小矩陣 SVD（更貼近超大資料的 top-k 近似）
 05-oja-online-pca/ Oja’s online PCA：線上/串流（mini-batch）學 top-k 主成分子空間
+06-randomized-svd-vs-oja-benchmark/ Randomized SVD vs Oja：同資料的品質/成本對照（sweep 超參數）
 ```
