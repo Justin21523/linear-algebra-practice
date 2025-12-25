@@ -69,6 +69,7 @@
 - LSMR：可視為在 normal equations 上做 MINRES（但不形成 `AᵀA`），用 `‖Aᵀr‖` 作為核心收斂指標，並與 LSQR 比較迭代數/收斂行為。
 - 進階預條件化（Randomized QR）：用 oversampled sketch `SA` 做 QR 取 `R` 當右預條件器（`x=R⁻¹y`），常能大幅降低 LSMR/LSQR 的迭代數。
 - Damped LSMR（Ridge）+ stopping + CV：把 LSMR 套到 `(AᵀA+damp²I)x=Aᵀb`，用 `‖Aᵀ(Ax-b)+damp²x‖` 做收斂驗收，並用 k-fold CV 選 `damp`。
+- Damped LSMR + 預條件化 + CV 總成本：在同一題比較 `none/col-scaling/rand-QR`，同時看 `iters`、`‖Ax-b‖`、`‖Aᵀr+damp²x‖`，以及掃完整條 `damp` 曲線的 `total_build_s/total_solve_s/total_iters`（更貼近 ML 調參成本）。
 
 ---
 

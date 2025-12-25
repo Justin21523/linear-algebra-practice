@@ -38,6 +38,7 @@
 17-lsmr-iterative-least-squares/   LSMR：normal equations 上的 MINRES（教學版）+ 與 LSQR 對照
 18-lsmr-advanced-preconditioning-randomized-qr/ 進階預條件化：Randomized QR（Blendenpik/LSRN 風格）加速 LSMR/LSQR
 19-lsmr-damped-stopping-and-cv/   Damped LSMR（Ridge）+ stopping criteria + k-fold CV 選 damp
+20-lsmr-damped-preconditioning-and-cv/ Damped LSMR + 預條件化（none/col/rand-QR）+ CV 曲線總成本對照
 ```
 
 ## 學習目標
