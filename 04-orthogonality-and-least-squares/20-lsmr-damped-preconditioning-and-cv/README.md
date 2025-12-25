@@ -11,11 +11,11 @@
 1. 看到 `damp` 與預條件化的互補：`damp` 改善條件數但不一定夠；好的 preconditioner 能把迭代數大幅壓下來
 2. 用一致的收斂驗收：`‖Ax-b‖` 與 `‖Aᵀ(Ax-b)+damp²x‖`
 3. 以 ML 角度做決策：不只看最佳 val RMSE，也要看「CV 掃完整條曲線」的總成本
+4. （實務）把「掃超參數曲線」做快：continuation/warm-start（沿 damp grid 接續）＋ rand-QR 的 reuse（shared sketch / fixed-R）
 
 ## 本單元實作（Python）
 
 ```
 python/
-└── lsmr_damped_preconditioning_and_cv_numpy.py   # three preconditioners × damp sweep + k-fold CV cost comparison
+└── lsmr_damped_preconditioning_and_cv_numpy.py   # baseline vs speedups: warm-start + rand-QR reuse, plus k-fold CV curve cost
 ```
-

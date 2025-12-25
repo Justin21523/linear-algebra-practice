@@ -18,6 +18,10 @@ Then we run k-fold CV over a damp grid and report the total cost of sweeping the
   - total build time (preconditioners)  # EN: Part 1.
   - total solve time (Krylov iterations)  # EN: Part 2.
   - total iterations across all fits  # EN: Part 3.
+
+We also demonstrate two practical ways to reduce the cost of sweeping a full damp curve (common in ML hyperparameter tuning):  # EN: Add motivation for the "speedups" section.
+  - continuation / warm-start across the damp grid (per fold)  # EN: Reuse the previous solution as an initial guess.
+  - reusing randomized-QR components (shared sketch or fixed preconditioner)  # EN: Avoid rebuilding the expensive preconditioner for every damp.
 """  # EN: End module docstring.
 
 from __future__ import annotations  # EN: Enable forward references in type annotations.
@@ -38,6 +42,15 @@ np.set_printoptions(precision=PRINT_PRECISION, suppress=True)  # EN: Configure N
 
 Matvec = Callable[[np.ndarray], np.ndarray]  # EN: Alias for a matrix-vector product function.
 PrecondKind = Literal["none", "col", "randqr"]  # EN: Supported preconditioner kinds for this unit.
+RandQRPolicy = Literal["rebuild", "shared_sketch", "fixed_R"]  # EN: Policies for building/reusing rand-QR preconditioners along a damp sweep.
+
+
+@dataclass(frozen=True)  # EN: Immutable container for a reusable randomized sketch for [A; damp I].
+class RandQRSketch:  # EN: Store pieces so SA_aug can be updated cheaply for different damp values.
+    S_top: np.ndarray  # EN: Sketch block multiplying the data rows (shape s×m).
+    S_bottom: np.ndarray  # EN: Sketch block multiplying the identity rows (shape s×n).
+    SA_top: np.ndarray  # EN: Precomputed product S_top @ A (shape s×n).
+    s: int  # EN: Sketch row count.
 
 
 @dataclass(frozen=True)  # EN: Immutable record for one solver run (single damp, single preconditioner).
@@ -174,22 +187,33 @@ def column_scaling_D_aug(A: np.ndarray, damp: float) -> np.ndarray:  # EN: Build
     return D.astype(float)  # EN: Return D as float.
 
 
-def randomized_qr_preconditioner_R_aug(  # EN: Build R from QR(S [A; damp I]) for right preconditioning.
+def choose_randqr_sketch_rows(m_aug: int, n: int, sketch_factor: float) -> int:  # EN: Choose sketch row count s for an oversampled rand-QR preconditioner.
+    s_target = int(round(sketch_factor * n))  # EN: Oversampled target like 4n.
+    s = int(max(n, min(m_aug, s_target)))  # EN: Clamp s into [n, m_aug] so QR is well-posed.
+    return int(s)  # EN: Return as Python int.
+
+
+def build_randqr_sketch(  # EN: Build a reusable sketch S partitioned into [S_top, S_bottom] for [A; damp I].
     A: np.ndarray,  # EN: Design matrix (m×n).
-    damp: float,  # EN: Damping parameter controlling the augmented rows.
-    sketch_factor: float,  # EN: Oversampling factor for sketch rows (e.g., 4.0 => s≈4n).
+    sketch_factor: float,  # EN: Oversampling factor for sketch rows.
     rng: np.random.Generator,  # EN: RNG for sketch construction.
-) -> np.ndarray:  # EN: Return upper-triangular R (n×n).
+) -> RandQRSketch:  # EN: Return a RandQRSketch so SA_aug(damp) can be formed cheaply.
     m, n = A.shape  # EN: Extract dimensions.
     m_aug = m + n  # EN: Augmented row count for [A; damp I].
-    s = int(max(n, min(m_aug, int(round(sketch_factor * n)))))  # EN: Choose sketch rows s in [n, m_aug].
+    s = choose_randqr_sketch_rows(m_aug=m_aug, n=n, sketch_factor=sketch_factor)  # EN: Choose sketch rows.
 
-    # EN: Form A_aug explicitly for simplicity (small teaching demo).  # EN: Note: large-scale versions avoid forming A_aug.
-    A_aug = np.vstack([A, damp * np.eye(n, dtype=float)])  # EN: Build augmented matrix [A; damp I].
+    # EN: Use a Rademacher sketch with entries ±1/sqrt(s).  # EN: Explain sketch choice.
+    S = rng.choice(np.array([-1.0, 1.0]), size=(s, m_aug)) / np.sqrt(max(s, 1))  # EN: Build dense sketch S (s×(m+n)).
+    S_top = S[:, :m]  # EN: Extract block that multiplies A rows.
+    S_bottom = S[:, m:]  # EN: Extract block that multiplies the identity rows.
+    SA_top = S_top @ A  # EN: Precompute S_top A once (expensive part).
 
-    # EN: Use a simple Rademacher sketch S with entries ±1/sqrt(s).  # EN: Explain sketch choice.
-    S = rng.choice(np.array([-1.0, 1.0]), size=(s, m_aug)) / np.sqrt(max(s, 1))  # EN: Build S (s×m_aug).
-    A_sketch = S @ A_aug  # EN: Compute sketch SA_aug (s×n).
+    return RandQRSketch(S_top=S_top.astype(float), S_bottom=S_bottom.astype(float), SA_top=SA_top.astype(float), s=int(s))  # EN: Return sketch container.
+
+
+def randqr_R_from_sketch(sketch: RandQRSketch, damp: float) -> np.ndarray:  # EN: Compute R from QR(S [A; damp I]) using a prebuilt sketch.
+    # EN: Since A_aug=[A;damp I], we have S A_aug = S_top A + damp S_bottom.  # EN: Show the key algebra.
+    A_sketch = sketch.SA_top + float(damp) * sketch.S_bottom  # EN: Form SA_aug(damp) without explicitly building A_aug.
 
     # EN: Reduced QR gives SA_aug = Q R, with R (n×n) upper-triangular.  # EN: Explain QR output.
     _, R = np.linalg.qr(A_sketch, mode="reduced")  # EN: Compute QR to extract R.
@@ -201,7 +225,31 @@ def randomized_qr_preconditioner_R_aug(  # EN: Build R from QR(S [A; damp I]) fo
 
     # EN: Add a tiny diagonal jitter if R is nearly singular (defensive for extreme cases).  # EN: Explain jitter.
     jitter = 1e-12 * float(np.linalg.norm(R, ord="fro"))  # EN: Scale jitter by Frobenius norm.
-    R = R + jitter * np.eye(n, dtype=float)  # EN: Stabilize R for solves.
+    R = R + jitter * np.eye(R.shape[0], dtype=float)  # EN: Stabilize R for solves.
+    return R.astype(float)  # EN: Return R as float.
+
+
+def upper_triangular_preconditioner_from_R(  # EN: Create right-preconditioner apply_Minv/apply_Minv_T closures from an upper-triangular R.
+    R: np.ndarray,  # EN: Upper-triangular matrix defining M=R.
+    label: str,  # EN: Human-readable label for printing.
+) -> tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]]:  # EN: Return (label, Minv, Minv_T).
+    def apply_Minv(y: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-1} via triangular solve.
+        return np.linalg.solve(R, y)  # EN: Solve R x = y.
+
+    def apply_Minv_T(z: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-T} via triangular solve.
+        return np.linalg.solve(R.T, z)  # EN: Solve R^T x = z.
+
+    return label, apply_Minv, apply_Minv_T  # EN: Return preconditioner functions.
+
+
+def randomized_qr_preconditioner_R_aug(  # EN: Build R from QR(S [A; damp I]) for right preconditioning.
+    A: np.ndarray,  # EN: Design matrix (m×n).
+    damp: float,  # EN: Damping parameter controlling the augmented rows.
+    sketch_factor: float,  # EN: Oversampling factor for sketch rows (e.g., 4.0 => s≈4n).
+    rng: np.random.Generator,  # EN: RNG for sketch construction.
+) -> np.ndarray:  # EN: Return upper-triangular R (n×n).
+    sketch = build_randqr_sketch(A=A, sketch_factor=sketch_factor, rng=rng)  # EN: Build reusable sketch blocks.
+    R = randqr_R_from_sketch(sketch=sketch, damp=float(damp))  # EN: Compute R for this damp using the sketch.
     return R.astype(float)  # EN: Return R as float.
 
 
@@ -244,13 +292,7 @@ def build_preconditioner(  # EN: Build right preconditioner M and return apply_M
         R = randomized_qr_preconditioner_R_aug(A=A, damp=damp, sketch_factor=4.0, rng=rng)  # EN: Build R.
         build_seconds = float(perf_counter() - t0)  # EN: Stop build timer.
         label = "rand-QR(4n)"  # EN: Human label.
-
-        def apply_Minv(y: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-1} via triangular solve.
-            return np.linalg.solve(R, y)  # EN: Solve R x = y.
-
-        def apply_Minv_T(z: np.ndarray, R: np.ndarray = R) -> np.ndarray:  # EN: Apply R^{-T} via triangular solve.
-            return np.linalg.solve(R.T, z)  # EN: Solve R^T x = z.
-
+        label, apply_Minv, apply_Minv_T = upper_triangular_preconditioner_from_R(R=R, label=label)  # EN: Build apply closures from R.
         return label, apply_Minv, apply_Minv_T, build_seconds  # EN: Return preconditioner and timing.
 
     raise ValueError("Unknown preconditioner kind")  # EN: Guard against unreachable cases.
@@ -266,9 +308,18 @@ def lsmr_damped_minres_teaching(  # EN: Teaching LSMR for ridge: MINRES on norma
     atol: float,  # EN: Absolute tolerance for stopping.
     btol: float,  # EN: Relative tolerance for stopping.
     anorm_est: float,  # EN: Estimated ||A_aug||_2 (for stopping tests).
+    b_aug_bottom: np.ndarray | None = None,  # EN: Optional bottom RHS for the augmented system (length n); default is zeros.
 ) -> tuple[np.ndarray, int, str, float, float, float, float]:  # EN: Return (x, iters, reason, rnorm_data, grad_norm, xnorm, rnorm_aug).
     m, n = A.shape  # EN: Extract dimensions.
-    bnorm = l2_norm(b)  # EN: ||b|| used in residual bound.
+    if b_aug_bottom is None:  # EN: Default bottom RHS is zero (standard ridge).
+        b_bottom = np.zeros((n,), dtype=float)  # EN: Use zeros for the regularization rows.
+    else:  # EN: Accept a non-zero bottom RHS (used for warm-start correction solves).
+        b_bottom = np.asarray(b_aug_bottom, dtype=float).reshape(-1)  # EN: Convert to 1D float array.
+        if b_bottom.size != n:  # EN: Validate length.
+            raise ValueError("b_aug_bottom must have length n")  # EN: Reject mismatched bottom RHS.
+
+    b_aug = np.concatenate([b, b_bottom])  # EN: Build augmented RHS [b; b_bottom].
+    bnorm = l2_norm(b_aug)  # EN: Use ||b_aug|| in residual-bound stopping tests.
 
     # EN: Define augmented operator B = [A; damp I] M^{-1} via matvecs.  # EN: Explain operator design.
     def matvec_B(y: np.ndarray) -> np.ndarray:  # EN: Compute B y = [A x; damp x] where x = M^{-1} y.
@@ -283,19 +334,21 @@ def lsmr_damped_minres_teaching(  # EN: Teaching LSMR for ridge: MINRES on norma
         z = (A.T @ u_top) + (damp * u_bottom)  # EN: Compute A_aug^T u_aug in x-space.
         return apply_Minv_T(z)  # EN: Apply M^{-T} to map to y-space.
 
-    b_aug = np.concatenate([b, np.zeros((n,), dtype=float)])  # EN: Augmented RHS [b; 0].
-    gnorm_x = l2_norm(A.T @ b)  # EN: ||A^T b|| used for relative gradient tests (x-space scale).
+    # EN: For general augmented RHS [b; b_bottom], normal-equations RHS is A^T b + damp b_bottom.  # EN: Explain scaling.
+    gnorm_x = l2_norm((A.T @ b) + (damp * b_bottom))  # EN: Scale for relative-gradient stopping tests (x-space).
 
     # EN: Initialize Golub–Kahan bidiagonalization with u1 = b_aug / ||b_aug||.  # EN: Explain initialization.
     u = b_aug.copy()  # EN: Start u from b_aug.
-    beta1 = l2_norm(u)  # EN: beta1 = ||b_aug|| (=||b||).
+    beta1 = l2_norm(u)  # EN: beta1 = ||b_aug||.
     if beta1 < EPS:  # EN: Trivial b=0 case.
         x0 = np.zeros((n,), dtype=float)  # EN: Solution is x=0.
-        r0 = A @ x0 - b  # EN: Residual is -b.
-        grad0 = (A.T @ r0) + (damp * damp) * x0  # EN: Gradient at x=0.
-        rnorm_data0 = l2_norm(r0)  # EN: ||Ax-b||.
+        r0_top = A @ x0 - b  # EN: Top residual is -b.
+        r0_bottom = (damp * x0) - b_bottom  # EN: Bottom residual is -b_bottom.
+        grad0 = (A.T @ r0_top) + (damp * r0_bottom)  # EN: Gradient A^T r_top + damp r_bottom.
+        rnorm_data0 = l2_norm(r0_top)  # EN: ||Ax-b|| (data residual).
         xnorm0 = l2_norm(x0)  # EN: ||x||.
-        rnorm_aug0 = float(np.sqrt(rnorm_data0 * rnorm_data0 + (damp * xnorm0) ** 2))  # EN: ||[r;damp x]||.
+        rnorm_bottom0 = l2_norm(r0_bottom)  # EN: ||damp x - b_bottom||.
+        rnorm_aug0 = float(np.sqrt(rnorm_data0 * rnorm_data0 + rnorm_bottom0 * rnorm_bottom0))  # EN: ||[r_top;r_bottom]||.
         return x0, 0, "b is zero (trivial)", rnorm_data0, l2_norm(grad0), xnorm0, rnorm_aug0  # EN: Return.
     u = u / beta1  # EN: Normalize u1.
 
@@ -303,11 +356,13 @@ def lsmr_damped_minres_teaching(  # EN: Teaching LSMR for ridge: MINRES on norma
     alpha1 = l2_norm(v)  # EN: alpha1 = ||v1||.
     if alpha1 < EPS:  # EN: Degenerate case B^T b_aug = 0.
         x0 = np.zeros((n,), dtype=float)  # EN: Use x=0.
-        r0 = A @ x0 - b  # EN: Residual.
-        grad0 = (A.T @ r0) + (damp * damp) * x0  # EN: Gradient.
-        rnorm_data0 = l2_norm(r0)  # EN: ||Ax-b||.
+        r0_top = A @ x0 - b  # EN: Top residual.
+        r0_bottom = (damp * x0) - b_bottom  # EN: Bottom residual.
+        grad0 = (A.T @ r0_top) + (damp * r0_bottom)  # EN: Gradient for augmented objective.
+        rnorm_data0 = l2_norm(r0_top)  # EN: ||Ax-b||.
         xnorm0 = l2_norm(x0)  # EN: ||x||.
-        rnorm_aug0 = float(np.sqrt(rnorm_data0 * rnorm_data0 + (damp * xnorm0) ** 2))  # EN: ||[r;damp x]||.
+        rnorm_bottom0 = l2_norm(r0_bottom)  # EN: ||damp x - b_bottom||.
+        rnorm_aug0 = float(np.sqrt(rnorm_data0 * rnorm_data0 + rnorm_bottom0 * rnorm_bottom0))  # EN: ||[r_top;r_bottom]||.
         return x0, 0, "B^T b is zero (degenerate)", rnorm_data0, l2_norm(grad0), xnorm0, rnorm_aug0  # EN: Return.
     v = v / alpha1  # EN: Normalize v1.
 
@@ -352,11 +407,13 @@ def lsmr_damped_minres_teaching(  # EN: Teaching LSMR for ridge: MINRES on norma
         x_hat = apply_Minv(y_k)  # EN: Map back x = M^{-1} y.
 
         # EN: Compute ridge diagnostics in original coordinates.  # EN: Explain compute.
-        r = A @ x_hat - b  # EN: Data residual.
-        grad = (A.T @ r) + (damp * damp) * x_hat  # EN: Ridge gradient / optimality residual.
+        r_top = A @ x_hat - b  # EN: Top residual (data-fit part).
+        r_bottom = (damp * x_hat) - b_bottom  # EN: Bottom residual (regularization rows).
+        grad = (A.T @ r_top) + (damp * r_bottom)  # EN: Gradient of ||[A;damp I]x-[b;b_bottom]||^2.
         xnorm = l2_norm(x_hat)  # EN: ||x||.
-        rnorm_data = l2_norm(r)  # EN: ||Ax-b||.
-        rnorm_aug = float(np.sqrt(rnorm_data * rnorm_data + (damp * xnorm) ** 2))  # EN: ||[r;damp x]||.
+        rnorm_data = l2_norm(r_top)  # EN: ||Ax-b||.
+        rnorm_bottom = l2_norm(r_bottom)  # EN: ||damp x - b_bottom||.
+        rnorm_aug = float(np.sqrt(rnorm_data * rnorm_data + rnorm_bottom * rnorm_bottom))  # EN: ||[r_top;r_bottom]||.
         grad_norm = l2_norm(grad)  # EN: ||A^T r + damp^2 x||.
 
         n_done = k  # EN: Update completed iteration count.
@@ -385,11 +442,13 @@ def lsmr_damped_minres_teaching(  # EN: Teaching LSMR for ridge: MINRES on norma
         v = v_next  # EN: Advance v.
 
     # EN: Final diagnostics in original coordinates.  # EN: Explain final compute.
-    r_final = A @ x_hat - b  # EN: Final residual.
-    grad_final = (A.T @ r_final) + (damp * damp) * x_hat  # EN: Final gradient.
+    r_final_top = A @ x_hat - b  # EN: Final top residual.
+    r_final_bottom = (damp * x_hat) - b_bottom  # EN: Final bottom residual.
+    grad_final = (A.T @ r_final_top) + (damp * r_final_bottom)  # EN: Final gradient for augmented objective.
     xnorm_final = l2_norm(x_hat)  # EN: Final ||x||.
-    rnorm_data_final = l2_norm(r_final)  # EN: Final ||Ax-b||.
-    rnorm_aug_final = float(np.sqrt(rnorm_data_final * rnorm_data_final + (damp * xnorm_final) ** 2))  # EN: Final ||[r;damp x]||.
+    rnorm_data_final = l2_norm(r_final_top)  # EN: Final ||Ax-b||.
+    rnorm_bottom_final = l2_norm(r_final_bottom)  # EN: Final ||damp x - b_bottom||.
+    rnorm_aug_final = float(np.sqrt(rnorm_data_final * rnorm_data_final + rnorm_bottom_final * rnorm_bottom_final))  # EN: Final ||[r_top;r_bottom]||.
     grad_norm_final = l2_norm(grad_final)  # EN: Final ||grad||.
 
     return x_hat, int(n_done), stop_reason, float(rnorm_data_final), float(grad_norm_final), float(xnorm_final), float(rnorm_aug_final)  # EN: Return final values.
@@ -405,6 +464,9 @@ def solve_one(  # EN: Solve one ridge problem for a specific damp and preconditi
     btol: float,  # EN: Relative tolerance.
     estimate_norm_steps: int,  # EN: Steps for ||A_aug|| estimate.
     rng: np.random.Generator,  # EN: RNG.
+    x_init: np.ndarray | None = None,  # EN: Optional warm-start initial guess in x-space; used as continuation across damp.
+    precond_override: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None,  # EN: Optional prebuilt (label, Minv, Minv_T).
+    build_seconds_override: float | None = None,  # EN: Optional build-time override (used when precond_override is provided).
 ) -> SolveReport:  # EN: Return SolveReport with diagnostics and timing.
     m, n = A.shape  # EN: Extract dimensions.
 
@@ -427,13 +489,30 @@ def solve_one(  # EN: Solve one ridge problem for a specific damp and preconditi
         A_aug = np.vstack([A, damp * np.eye(n, dtype=float)])  # EN: Form A_aug for the cheap bound.
         anorm_est = float(np.linalg.norm(A_aug, ord="fro"))  # EN: Use ||A_aug||_F as an upper bound.
 
-    # EN: Build preconditioner (may depend on damp via augmented operator).  # EN: Explain preconditioner build.
-    label, apply_Minv, apply_Minv_T, build_seconds = build_preconditioner(kind=precond_kind, A=A, damp=damp, rng=rng)  # EN: Build preconditioner.
+    # EN: Choose the preconditioner: either build it here, or reuse a prebuilt one supplied by the caller.  # EN: Explain override.
+    if precond_override is None:  # EN: Default behavior (baseline): build preconditioner per call.
+        label, apply_Minv, apply_Minv_T, build_seconds = build_preconditioner(kind=precond_kind, A=A, damp=damp, rng=rng)  # EN: Build preconditioner.
+    else:  # EN: Reuse a cached preconditioner (e.g., fixed rand-QR across a damp grid).
+        label, apply_Minv, apply_Minv_T = precond_override  # EN: Unpack prebuilt closures.
+        build_seconds = float(build_seconds_override) if build_seconds_override is not None else 0.0  # EN: Use explicit build time (or 0 when reused).
 
     t0 = perf_counter()  # EN: Start solve timer.
-    x_hat, iters, stop_reason, rnorm_data, grad_norm, xnorm, _ = lsmr_damped_minres_teaching(  # EN: Run solver.
+
+    # EN: Warm-start via a correction solve: set b_aug=[b-Ax0; -damp x0] so the residual corresponds to x=x0+delta.  # EN: Explain trick.
+    if x_init is None:  # EN: No warm-start (x0=0).
+        b_top = b  # EN: Top RHS is the original b.
+        b_bottom = None  # EN: Bottom RHS defaults to zeros in the solver.
+        x0 = np.zeros((n,), dtype=float)  # EN: Define x0 explicitly for uniform handling below.
+    else:  # EN: Warm-start enabled.
+        x0 = np.asarray(x_init, dtype=float).reshape(-1)  # EN: Convert to 1D float array.
+        if x0.size != n:  # EN: Validate length.
+            raise ValueError("x_init must have length n")  # EN: Reject invalid warm-start vector.
+        b_top = b - (A @ x0)  # EN: Top RHS becomes the data residual at x0.
+        b_bottom = -float(damp) * x0  # EN: Bottom RHS becomes -damp x0 so damp residual is damp(x0+delta).
+
+    x_delta, iters, stop_reason, _, _, _, _ = lsmr_damped_minres_teaching(  # EN: Run solver (returns delta when warm-start is used).
         A=A,  # EN: Provide A.
-        b=b,  # EN: Provide b.
+        b=b_top,  # EN: Provide top RHS (possibly shifted for warm-start).
         damp=damp,  # EN: Provide damp.
         apply_Minv=apply_Minv,  # EN: Provide M^{-1}.
         apply_Minv_T=apply_Minv_T,  # EN: Provide M^{-T}.
@@ -441,8 +520,17 @@ def solve_one(  # EN: Solve one ridge problem for a specific damp and preconditi
         atol=atol,  # EN: Provide atol.
         btol=btol,  # EN: Provide btol.
         anorm_est=anorm_est,  # EN: Provide ||A_aug|| estimate.
+        b_aug_bottom=b_bottom,  # EN: Provide bottom RHS (or None for zeros).
     )  # EN: End solver call.
     solve_seconds = float(perf_counter() - t0)  # EN: Stop solve timer.
+
+    x_hat = (x0 + x_delta).astype(float)  # EN: Combine x0 and delta to get the final coefficients.
+    r_final = (A @ x_hat) - b  # EN: Compute final data residual in original coordinates.
+    grad_final = (A.T @ r_final) + (float(damp) * float(damp)) * x_hat  # EN: Compute ridge gradient A^T(Ax-b)+damp^2 x.
+
+    rnorm_data = l2_norm(r_final)  # EN: Report ||Ax-b||.
+    grad_norm = l2_norm(grad_final)  # EN: Report ||A^T r + damp^2 x||.
+    xnorm = l2_norm(x_hat)  # EN: Report ||x|| in original coordinates.
 
     return SolveReport(  # EN: Package report.
         precond=label,  # EN: Label.
@@ -508,6 +596,194 @@ def print_cv_table(points: list[CVPoint], best: CVPoint) -> None:  # EN: Print a
             f"{p.iters_mean:10.1f} | "  # EN: Mean iterations.
             f"{bar}{mark}"  # EN: Bar + marker.
         )  # EN: End print.
+
+
+def choose_fixed_randqr_reference_damp(damps_sorted: np.ndarray) -> float:  # EN: Pick a representative damp for building a fixed rand-QR preconditioner.
+    positive = damps_sorted[damps_sorted > 0.0]  # EN: Filter to strictly positive damps.
+    if positive.size == 0:  # EN: If no positive damp exists, fall back to 0.
+        return 0.0  # EN: Return zero reference.
+    return float(positive[positive.size // 2])  # EN: Return the median positive damp (in sorted order).
+
+
+def cv_sweep_curve(  # EN: Sweep a damp grid with k-fold CV, optionally using continuation and rand-QR reuse to reduce total cost.
+    splits: list[tuple[np.ndarray, np.ndarray]],  # EN: CV splits (train_idx, val_idx).
+    A: np.ndarray,  # EN: Full design matrix.
+    b: np.ndarray,  # EN: Full targets.
+    damps: np.ndarray,  # EN: Damp grid to sweep (will be sorted ascending).
+    precond_kind: PrecondKind,  # EN: Preconditioner kind.
+    randqr_policy: RandQRPolicy,  # EN: Policy for rand-QR (ignored unless precond_kind == "randqr").
+    warm_start: bool,  # EN: Whether to use continuation/warm-start across the damp grid within each fold.
+    max_iters: int,  # EN: Iteration cap.
+    atol: float,  # EN: Absolute tolerance.
+    btol: float,  # EN: Relative tolerance.
+    estimate_norm_steps: int,  # EN: Norm-estimation steps (costly but stabilizes stopping tests).
+    rng: np.random.Generator,  # EN: RNG for sketches and norm estimation.
+) -> tuple[list[CVPoint], CVTotals, CVPoint]:  # EN: Return (points, totals, best_point).
+    damps_sorted = np.array(sorted([float(d) for d in damps]), dtype=float)  # EN: Sort damps ascending for continuation.
+    n_damps = int(damps_sorted.size)  # EN: Number of damp values.
+    n_folds = int(len(splits))  # EN: Number of folds.
+    n_features = int(A.shape[1])  # EN: Feature count.
+
+    order = np.arange(n_damps, dtype=int)  # EN: Default evaluation order is ascending (good for printing).
+    if warm_start:  # EN: For continuation, it is often cheaper/more stable to start from large damp (strong regularization).
+        order = order[::-1]  # EN: Evaluate from largest damp down to smallest.
+
+    train_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store train RMSE per (damp, fold).
+    val_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store val RMSE per (damp, fold).
+    xnorm_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store ||x|| per (damp, fold).
+    iters_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store iterations per (damp, fold).
+
+    total_build = 0.0  # EN: Accumulate preconditioner build time across all fits in the curve.
+    total_solve = 0.0  # EN: Accumulate solver time across all fits in the curve.
+    total_iters = 0  # EN: Accumulate iterations across all fits in the curve.
+
+    # EN: Build a human label for the chosen configuration (used in summaries).  # EN: Explain labeling.
+    if precond_kind == "none":  # EN: Baseline no-preconditioner label.
+        label = "none"  # EN: Label.
+    elif precond_kind == "col":  # EN: Column-scaling label.
+        label = "col-scaling"  # EN: Label.
+    else:  # EN: randqr label depends on policy.
+        policy_tag = {"rebuild": "rand-QR(4n)", "shared_sketch": "rand-QR(shared-sketch)", "fixed_R": "rand-QR(fixed-R)"}[randqr_policy]  # EN: Map policy to a readable tag.
+        label = policy_tag  # EN: Assign label.
+    if warm_start:  # EN: Annotate label when warm-start is enabled.
+        label = f"{label}+ws"  # EN: Append warm-start suffix.
+
+    # EN: Precompute a reference damp for fixed-R policy (one preconditioner reused for the whole curve).  # EN: Explain reference damp.
+    damp_ref = choose_fixed_randqr_reference_damp(damps_sorted)  # EN: Reference damp for fixed-R builds.
+
+    for fold_id, (train_idx, val_idx) in enumerate(splits):  # EN: Loop folds (outer) to enable continuation within each fold.
+        A_tr = A[train_idx, :]  # EN: Training design matrix.
+        b_tr = b[train_idx]  # EN: Training targets.
+        A_va = A[val_idx, :]  # EN: Validation design matrix.
+        b_va = b[val_idx]  # EN: Validation targets.
+
+        x_prev = np.zeros((n_features,), dtype=float)  # EN: Initialize continuation with x=0 for the first damp.
+
+        # EN: For rand-QR reuse policies, build per-fold cached objects here (since A_tr changes per fold).  # EN: Explain caching scope.
+        randqr_sketch: RandQRSketch | None = None  # EN: Shared sketch S for this fold (optional).
+        randqr_fixed_precond: tuple[str, Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]] | None = None  # EN: Fixed preconditioner closures (optional).
+
+        if precond_kind == "randqr" and randqr_policy in {"shared_sketch", "fixed_R"}:  # EN: Build shared sketch once per fold when requested.
+            t0 = perf_counter()  # EN: Start sketch build timer.
+            randqr_sketch = build_randqr_sketch(A=A_tr, sketch_factor=4.0, rng=rng)  # EN: Build sketch blocks for this fold.
+            total_build += float(perf_counter() - t0)  # EN: Account for one-time sketch build cost.
+
+        if precond_kind == "randqr" and randqr_policy == "fixed_R":  # EN: Build a fixed R once per fold (then reuse across damps).
+            if randqr_sketch is None:  # EN: Defensive: fixed-R requires a sketch.
+                raise RuntimeError("internal error: randqr_sketch is None for fixed_R policy")  # EN: Fail fast.
+            t0 = perf_counter()  # EN: Start R build timer.
+            R_ref = randqr_R_from_sketch(sketch=randqr_sketch, damp=float(damp_ref))  # EN: Build R at the reference damp.
+            total_build += float(perf_counter() - t0)  # EN: Account for one-time QR cost.
+            randqr_fixed_precond = upper_triangular_preconditioner_from_R(R=R_ref, label="rand-QR(fixed-R)")  # EN: Build preconditioner closures.
+
+        for step, idx in enumerate(order):  # EN: Sweep damp values in the chosen continuation order.
+            damp = float(damps_sorted[idx])  # EN: Current damp value.
+            x_init = x_prev if (warm_start and step > 0) else None  # EN: Use previous x as warm-start except for the first step.
+
+            # EN: Select how to supply the preconditioner to solve_one based on the chosen rand-QR policy.  # EN: Explain branching.
+            if precond_kind != "randqr":  # EN: Non-randQR paths use the standard builder.
+                rep = solve_one(  # EN: Fit on the training fold.
+                    A=A_tr,  # EN: Training A.
+                    b=b_tr,  # EN: Training b.
+                    damp=float(damp),  # EN: Damp value.
+                    precond_kind=precond_kind,  # EN: Preconditioner kind.
+                    max_iters=max_iters,  # EN: Iter cap.
+                    atol=atol,  # EN: atol.
+                    btol=btol,  # EN: btol.
+                    estimate_norm_steps=estimate_norm_steps,  # EN: Norm estimation steps.
+                    rng=rng,  # EN: RNG.
+                    x_init=x_init,  # EN: Warm-start (optional).
+                )  # EN: End solve.
+            else:  # EN: randqr path supports the three policies.
+                if randqr_policy == "rebuild":  # EN: Baseline: rebuild rand-QR (fresh sketch) for every damp.
+                    rep = solve_one(  # EN: Fit with per-call preconditioner build.
+                        A=A_tr,  # EN: Training A.
+                        b=b_tr,  # EN: Training b.
+                        damp=float(damp),  # EN: Damp.
+                        precond_kind="randqr",  # EN: rand-QR.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        estimate_norm_steps=estimate_norm_steps,  # EN: Norm estimation.
+                        rng=rng,  # EN: RNG.
+                        x_init=x_init,  # EN: Warm-start (optional).
+                    )  # EN: End solve.
+                elif randqr_policy == "shared_sketch":  # EN: Rebuild R per damp, but reuse the expensive sketch S_top A.
+                    if randqr_sketch is None:  # EN: Defensive check.
+                        raise RuntimeError("internal error: randqr_sketch is None for shared_sketch policy")  # EN: Fail fast.
+                    t0 = perf_counter()  # EN: Time only the R-from-sketch build for this damp.
+                    R = randqr_R_from_sketch(sketch=randqr_sketch, damp=float(damp))  # EN: Build R using shared sketch.
+                    build_s = float(perf_counter() - t0)  # EN: Record build time for this damp.
+                    precond = upper_triangular_preconditioner_from_R(R=R, label="rand-QR(shared-sketch)")  # EN: Create apply closures from R.
+                    rep = solve_one(  # EN: Fit with an externally built preconditioner.
+                        A=A_tr,  # EN: Training A.
+                        b=b_tr,  # EN: Training b.
+                        damp=float(damp),  # EN: Damp.
+                        precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        estimate_norm_steps=estimate_norm_steps,  # EN: Norm estimation.
+                        rng=rng,  # EN: RNG.
+                        x_init=x_init,  # EN: Warm-start (optional).
+                        precond_override=precond,  # EN: Reuse prebuilt closures for this damp.
+                        build_seconds_override=build_s,  # EN: Charge only the QR cost here (sketch cost charged once per fold above).
+                    )  # EN: End solve.
+                elif randqr_policy == "fixed_R":  # EN: Reuse the SAME preconditioner R for all damp values in the curve.
+                    if randqr_fixed_precond is None:  # EN: Defensive check.
+                        raise RuntimeError("internal error: randqr_fixed_precond is None for fixed_R policy")  # EN: Fail fast.
+                    rep = solve_one(  # EN: Fit with the reused preconditioner.
+                        A=A_tr,  # EN: Training A.
+                        b=b_tr,  # EN: Training b.
+                        damp=float(damp),  # EN: Damp (objective still changes, only M is fixed).
+                        precond_kind="randqr",  # EN: Value ignored because we pass precond_override.
+                        max_iters=max_iters,  # EN: Cap.
+                        atol=atol,  # EN: atol.
+                        btol=btol,  # EN: btol.
+                        estimate_norm_steps=estimate_norm_steps,  # EN: Norm estimation.
+                        rng=rng,  # EN: RNG.
+                        x_init=x_init,  # EN: Warm-start (optional).
+                        precond_override=randqr_fixed_precond,  # EN: Reuse the fixed-R closures.
+                        build_seconds_override=0.0,  # EN: No per-damp build cost when R is fixed.
+                    )  # EN: End solve.
+                else:  # EN: Guard against unknown policy strings.
+                    raise ValueError("Unknown randqr_policy")  # EN: Reject invalid policy.
+
+            x_prev = rep.x_hat  # EN: Update continuation state (used only when warm_start=True).
+
+            train_rmse_mat[idx, fold_id] = rmse(y_true=b_tr, y_pred=A_tr @ rep.x_hat)  # EN: Compute train RMSE for this fit.
+            val_rmse_mat[idx, fold_id] = rmse(y_true=b_va, y_pred=A_va @ rep.x_hat)  # EN: Compute validation RMSE for this fit.
+            xnorm_mat[idx, fold_id] = float(rep.xnorm)  # EN: Record ||x||.
+            iters_mat[idx, fold_id] = float(rep.n_iters)  # EN: Record iterations.
+
+            total_build += float(rep.build_seconds)  # EN: Add per-fit build time (0 when reused or already charged separately).
+            total_solve += float(rep.solve_seconds)  # EN: Add per-fit solve time.
+            total_iters += int(rep.n_iters)  # EN: Add per-fit iterations.
+
+    points: list[CVPoint] = []  # EN: Collect per-damp CV summaries.
+    for i, damp in enumerate(damps_sorted):  # EN: Summarize each damp across folds.
+        train_row = train_rmse_mat[i, :]  # EN: Train RMSE values across folds.
+        val_row = val_rmse_mat[i, :]  # EN: Val RMSE values across folds.
+        x_row = xnorm_mat[i, :]  # EN: ||x|| values across folds.
+        it_row = iters_mat[i, :]  # EN: Iteration counts across folds.
+
+        key = f"d={damp:.0e}" if damp != 0.0 else "d=0"  # EN: Format parameter label.
+        points.append(  # EN: Append a CVPoint for this damp.
+            CVPoint(
+                key=key,  # EN: Label.
+                damp=float(damp),  # EN: Damp value.
+                train_mean=float(np.mean(train_row)),  # EN: Mean train RMSE.
+                train_std=float(np.std(train_row)),  # EN: Std train RMSE.
+                val_mean=float(np.mean(val_row)),  # EN: Mean val RMSE.
+                val_std=float(np.std(val_row)),  # EN: Std val RMSE.
+                x_norm_mean=float(np.mean(x_row)),  # EN: Mean ||x||.
+                iters_mean=float(np.mean(it_row)),  # EN: Mean iterations.
+            )
+        )  # EN: End append.
+
+    best = min(points, key=lambda p: p.val_mean)  # EN: Pick damp with lowest mean validation RMSE.
+    totals = CVTotals(precond=label, total_build_seconds=float(total_build), total_solve_seconds=float(total_solve), total_iters=int(total_iters))  # EN: Package totals.
+    return points, totals, best  # EN: Return curve, totals, and best point.
 
 
 def summarize_cv_for_damp(  # EN: Compute k-fold CV summary for one damp and one preconditioner, also accumulating cost.
@@ -642,54 +918,116 @@ def main() -> None:  # EN: Run per-damp comparisons and then k-fold CV cost comp
     # EN: k-fold CV sweep for damp and cost totals.  # EN: Explain next section.
     damps = np.concatenate(([0.0], np.logspace(-8, 1, num=15)))  # EN: Damp grid for CV.
 
-    print_separator("k-fold CV sweep: compare CV curves and total cost")  # EN: Announce CV section.
+    # EN: Baseline: no warm-start; rand-QR preconditioner rebuilt for every damp (fresh sketch each time).  # EN: Explain baseline.
+    print_separator("k-fold CV sweep (baseline): rebuild per damp, no warm-start")  # EN: Announce baseline CV section.
 
-    cv_summaries: list[tuple[str, float, float, float, int]] = []  # EN: Collect (label, best_damp, best_val, total_seconds, total_iters).
+    rng_cv_baseline = np.random.default_rng(SEED + 1)  # EN: Dedicated RNG so baseline is reproducible and independent.
+    baseline_rows: dict[PrecondKind, tuple[str, float, float, float, float, int]] = {}  # EN: Map kind -> (label, best_damp, best_val, build_s, solve_s, iters).
 
-    for pk in preconds:  # EN: Sweep preconditioners for CV comparison.
-        # EN: Accumulate points and totals for the entire curve (all damps × all folds).  # EN: Explain accumulation.
-        points: list[CVPoint] = []  # EN: CV points for this preconditioner.
-        total_build = 0.0  # EN: Total build time across curve.
-        total_solve = 0.0  # EN: Total solve time across curve.
-        total_iters = 0  # EN: Total iterations across curve.
+    for pk in preconds:  # EN: Sweep preconditioners for baseline comparison.
+        points, totals, best = cv_sweep_curve(  # EN: Run a full CV curve sweep for this preconditioner.
+            splits=splits,  # EN: Provide splits.
+            A=A,  # EN: Provide full A.
+            b=b,  # EN: Provide full b.
+            damps=damps,  # EN: Provide damp grid.
+            precond_kind=pk,  # EN: Preconditioner kind.
+            randqr_policy="rebuild",  # EN: Baseline policy (ignored unless pk=="randqr").
+            warm_start=False,  # EN: No continuation for baseline.
+            max_iters=max_iters,  # EN: Iteration cap.
+            atol=atol,  # EN: atol.
+            btol=btol,  # EN: btol.
+            estimate_norm_steps=estimate_norm_steps,  # EN: Norm-estimation steps.
+            rng=rng_cv_baseline,  # EN: RNG stream.
+        )  # EN: End sweep.
 
-        for d in damps:  # EN: Sweep damp grid.
-            point, b_s, s_s, it_s = summarize_cv_for_damp(  # EN: Summarize CV for this damp.
-                splits=splits,  # EN: Provide splits.
-                A=A,  # EN: Provide full A (folds slice it).
-                b=b,  # EN: Provide full b.
-                damp=float(d),  # EN: Damp value.
-                precond_kind=pk,  # EN: Preconditioner kind.
-                max_iters=max_iters,  # EN: Iteration cap.
-                atol=atol,  # EN: atol.
-                btol=btol,  # EN: btol.
-                estimate_norm_steps=estimate_norm_steps,  # EN: Norm-estimation steps.
-                rng=rng,  # EN: RNG.
-            )  # EN: End summarize call.
-            points.append(point)  # EN: Store CV point.
-            total_build += b_s  # EN: Accumulate build seconds.
-            total_solve += s_s  # EN: Accumulate solve seconds.
-            total_iters += it_s  # EN: Accumulate iterations.
-
-        best = min(points, key=lambda p: p.val_mean)  # EN: Choose damp with smallest mean val RMSE.
-        label = {"none": "none", "col": "col-scaling", "randqr": "rand-QR(4n)"}[pk]  # EN: Human label mapping.
-
-        print_separator(f"CV results: {label}")  # EN: Print per-preconditioner section header.
-        print_cv_table(points=points, best=best)  # EN: Print CV curve table.
-        total_seconds = float(total_build + total_solve)  # EN: Total curve cost in seconds.
+        print_separator(f"CV results (baseline): {totals.precond}")  # EN: Print per-preconditioner header.
+        print_cv_table(points=points, best=best)  # EN: Print the CV curve table.
+        total_seconds = float(totals.total_build_seconds + totals.total_solve_seconds)  # EN: Total curve cost.
         print(  # EN: Print cost summary line.
-            f"\nTotal curve cost ({label}): build={total_build:.3f}s, solve={total_solve:.3f}s, total={total_seconds:.3f}s, iters={total_iters}"  # EN: Summary string.
+            f"\nTotal curve cost (baseline, {totals.precond}): build={totals.total_build_seconds:.3f}s, solve={totals.total_solve_seconds:.3f}s, total={total_seconds:.3f}s, iters={totals.total_iters}"  # EN: Summary string.
         )  # EN: End print.
 
-        cv_summaries.append((label, float(best.damp), float(best.val_mean), total_seconds, int(total_iters)))  # EN: Store summary.
+        baseline_rows[pk] = (totals.precond, float(best.damp), float(best.val_mean), float(totals.total_build_seconds), float(totals.total_solve_seconds), int(totals.total_iters))  # EN: Store summary.
 
-    print_separator("CV summary across preconditioners")  # EN: Print final comparison header.
-    header = "precond        | best_damp | best_val_rmse | total_curve_s | total_iters"  # EN: Header columns.
+    print_separator("Baseline CV summary across preconditioners")  # EN: Print final baseline comparison header.
+    header = "precond        | best_damp | best_val_rmse | build_s | solve_s | total_s | total_iters"  # EN: Header columns.
     print(header)  # EN: Print header.
     print("-" * len(header))  # EN: Divider.
-    for label, best_d, best_val, total_s, iters in cv_summaries:  # EN: Print each preconditioner summary.
+    for pk in preconds:  # EN: Print rows in consistent precond order.
+        label, best_d, best_val, build_s, solve_s, iters = baseline_rows[pk]  # EN: Unpack summary.
+        total_s = float(build_s + solve_s)  # EN: Total seconds.
         damp_str = f"{best_d:.0e}" if best_d != 0.0 else "0"  # EN: Format damp.
-        print(f"{label:13} | {damp_str:9} | {best_val:13.3e} | {total_s:13.3f} | {iters:10d}")  # EN: Print row.
+        print(f"{label:13} | {damp_str:9} | {best_val:13.3e} | {build_s:7.3f} | {solve_s:7.3f} | {total_s:7.3f} | {iters:10d}")  # EN: Print row.
+
+    # EN: Speedups: continuation (warm-start) + rand-QR reuse (shared sketch), to reduce the cost of sweeping the whole curve.  # EN: Explain speedups.
+    print_separator("CV sweep speedups: continuation + rand-QR reuse")  # EN: Announce speedup section.
+
+    rng_cv_speed = np.random.default_rng(SEED + 2)  # EN: Separate RNG stream for the speedup experiment.
+    speed_rows: dict[PrecondKind, tuple[str, float, float, float, float, int]] = {}  # EN: Map kind -> (label, best_damp, best_val, build_s, solve_s, iters).
+
+    for pk in preconds:  # EN: Sweep preconditioners with speedups enabled.
+        policy = "shared_sketch" if pk == "randqr" else "rebuild"  # EN: Only rand-QR uses special reuse; others ignore policy.
+        points, totals, best = cv_sweep_curve(  # EN: Run CV sweep with continuation and chosen reuse policy.
+            splits=splits,  # EN: Provide splits.
+            A=A,  # EN: Provide full A.
+            b=b,  # EN: Provide full b.
+            damps=damps,  # EN: Provide damp grid.
+            precond_kind=pk,  # EN: Preconditioner kind.
+            randqr_policy=policy,  # EN: Reuse policy for rand-QR.
+            warm_start=True,  # EN: Enable continuation across the damp grid.
+            max_iters=max_iters,  # EN: Iteration cap.
+            atol=atol,  # EN: atol.
+            btol=btol,  # EN: btol.
+            estimate_norm_steps=estimate_norm_steps,  # EN: Norm-estimation steps.
+            rng=rng_cv_speed,  # EN: RNG stream.
+        )  # EN: End sweep.
+
+        total_seconds = float(totals.total_build_seconds + totals.total_solve_seconds)  # EN: Total curve cost.
+        damp_str = f"{best.damp:.0e}" if best.damp != 0.0 else "0"  # EN: Format best damp for printing.
+        print(  # EN: Print a compact summary line (tables already printed above for baseline).
+            f"{totals.precond:18} best_damp={damp_str:>9} best_val={best.val_mean:.3e} total={total_seconds:.3f}s (build={totals.total_build_seconds:.3f}s, solve={totals.total_solve_seconds:.3f}s) iters={totals.total_iters}"  # EN: Summary string.
+        )  # EN: End print.
+        speed_rows[pk] = (totals.precond, float(best.damp), float(best.val_mean), float(totals.total_build_seconds), float(totals.total_solve_seconds), int(totals.total_iters))  # EN: Store summary.
+
+    # EN: Compare baseline vs speedups in one table (time + iterations + best validation RMSE).  # EN: Explain comparison.
+    print_separator("Baseline vs speedups (time/iters/quality)")  # EN: Announce comparison table.
+    header = "precond        | base_total_s | sped_total_s | speedup | base_iters | sped_iters | base_best_val | sped_best_val"  # EN: Header columns.
+    print(header)  # EN: Print header.
+    print("-" * len(header))  # EN: Divider.
+    for pk in preconds:  # EN: Loop in consistent order.
+        b_label, _, b_best_val, b_build, b_solve, b_iters = baseline_rows[pk]  # EN: Unpack baseline.
+        s_label, _, s_best_val, s_build, s_solve, s_iters = speed_rows[pk]  # EN: Unpack speedup.
+        _ = s_label  # EN: Keep labels aligned; baseline label is shown in the first column.
+        base_total = float(b_build + b_solve)  # EN: Baseline total seconds.
+        sped_total = float(s_build + s_solve)  # EN: Speedup total seconds.
+        speedup = (base_total / max(sped_total, EPS))  # EN: Compute speedup factor.
+        print(  # EN: Print comparison row.
+            f"{b_label:13} | {base_total:11.3f} | {sped_total:11.3f} | {speedup:7.2f} | {b_iters:9d} | {s_iters:9d} | {b_best_val:12.3e} | {s_best_val:12.3e}"  # EN: Row.
+        )  # EN: End print.
+
+    # EN: Extra: for rand-QR, compare shared-sketch vs fixed-R reuse (both with warm-start).  # EN: Explain extra experiment.
+    print_separator("rand-QR reuse variants (warm-start): shared-sketch vs fixed-R")  # EN: Announce extra experiment.
+    rng_cv_fixed = np.random.default_rng(SEED + 3)  # EN: Separate RNG for fixed-R variant.
+    points_fixed, totals_fixed, best_fixed = cv_sweep_curve(  # EN: Run fixed-R variant.
+        splits=splits,  # EN: Provide splits.
+        A=A,  # EN: Provide full A.
+        b=b,  # EN: Provide full b.
+        damps=damps,  # EN: Provide damp grid.
+        precond_kind="randqr",  # EN: rand-QR only.
+        randqr_policy="fixed_R",  # EN: Fixed-R reuse across the whole curve.
+        warm_start=True,  # EN: Continuation across damps.
+        max_iters=max_iters,  # EN: Iteration cap.
+        atol=atol,  # EN: atol.
+        btol=btol,  # EN: btol.
+        estimate_norm_steps=estimate_norm_steps,  # EN: Norm estimation.
+        rng=rng_cv_fixed,  # EN: RNG stream.
+    )  # EN: End sweep.
+    _ = points_fixed  # EN: Keep points available for optional debugging/printing.
+    total_fixed = float(totals_fixed.total_build_seconds + totals_fixed.total_solve_seconds)  # EN: Total seconds for fixed-R.
+    damp_str = f"{best_fixed.damp:.0e}" if best_fixed.damp != 0.0 else "0"  # EN: Format best damp for printing.
+    print(  # EN: Print fixed-R summary.
+        f"{totals_fixed.precond:18} best_damp={damp_str:>9} best_val={best_fixed.val_mean:.3e} total={total_fixed:.3f}s (build={totals_fixed.total_build_seconds:.3f}s, solve={totals_fixed.total_solve_seconds:.3f}s) iters={totals_fixed.total_iters}"  # EN: Summary line.
+    )  # EN: End print.
 
 
 if __name__ == "__main__":  # EN: Standard Python entrypoint guard.

@@ -67,6 +67,37 @@ python3 lsmr_damped_preconditioning_and_cv_numpy.py
 - `total_solve_s`：整條曲線所有 fits 的求解時間總和
 - `total_iters`：整條曲線所有 fits 的迭代數總和（與 matvec 成本高度相關）
 
+### 掃 `damp` 曲線怎麼做快？（continuation / warm-start）
+
+直覺：相鄰的 `damp` 解通常很接近（尤其是 log-grid），所以你不需要每個點都「從 x=0 重新開始」。
+
+本單元用一個實務常見的小技巧來做到 warm-start：**把「初始猜測 x0」轉成一次「解增量 delta」的等價最小平方**。
+
+- 原題（Ridge）：`min_x ‖Ax-b‖² + damp²‖x‖²`
+- 令 `x = x0 + delta`，可等價成解：
+  - `min_delta ‖A delta - (b - A x0)‖² + ‖damp delta - (-damp x0)‖²`
+
+你可以把它理解成：
+
+- 不去改 solver（不用在 LSMR 裡加「初始解」功能）
+- 而是把「初始解」吸收到 RHS 裡，讓 solver 解一個「修正量 delta」
+- 最後再把 `x = x0 + delta` 合回去
+
+### rand-QR 的 reuse：shared sketch / fixed-R
+
+rand-QR 類預條件器（Blendenpik/LSRN 風格）的痛點是：**build 很貴**。如果你在 CV 要掃 15 個 `damp`、5 folds，就是 75 次 build。
+
+本單元示範兩種「不改問題答案，但把曲線掃描做快」的方式：
+
+1. **shared sketch**（每個 fold 共用同一個 sketch）
+   - 把 sketch `S` 分成：`S=[S_top, S_bottom]`，對應到 `[A; damp I]` 的上/下兩塊
+   - 因為 `S[A;damp I] = S_top A + damp S_bottom`，所以你可以：
+     - 先算一次 `S_top A`（最貴）
+     - 每個 `damp` 只要更新 `+ damp S_bottom`，再做一次 QR 取 `R`
+2. **fixed-R**（每個 fold 只在某個參考 `damp_ref` build 一次 `R`，整條曲線都重用）
+   - build 幾乎砍到「每 fold 一次」
+   - 代價是：因為 `M` 不再跟著 `damp` 變，收斂速度/品質可能會跟 shared-sketch 不同（所以要看 `best_val_rmse` 與 `total_iters`）
+
 ## 程式碼區段（節錄 + 解釋）
 
 > 節錄 right preconditioning 的算子包裝（把 `B = [A;damp I] M⁻¹` 當成新的線性算子）。
@@ -84,13 +115,46 @@ def matvec_BT(u_aug):
 - `matvec_B`：讓 solver 只看到「預條件化後」的算子 `B`，不需要真的形成 `B`。
 - `matvec_BT`：transpose-matvec 必須一致（這點做錯，迭代法會壞掉或收斂異常）。
 
+> 節錄 warm-start（continuation）用的「修正量 delta」等價 RHS（讓每個 damp 不用從零開始）。
+
+```text
+if x_init is None:
+    b_top = b
+    b_bottom = None
+    x0 = zeros(n)
+else:
+    b_top = b - A @ x0
+    b_bottom = -damp * x0
+
+x_delta = solver(A, b_top, b_bottom)
+x_hat = x0 + x_delta
+```
+
+- `b_top=b-Ax0`：把「目前解 x0」的資料殘差變成新的 RHS。
+- `b_bottom=-damp*x0`：讓擴增系統的下半部殘差對應到 `damp*(x0+delta)`。
+- solver 回傳的是 `delta`，最後再合成 `x_hat`。
+
+> 節錄 shared-sketch 的核心等式：`S[A;damp I] = S_top A + damp S_bottom`（避免每個 damp 都重建完整 SA_aug）。
+
+```text
+S = rademacher(s, m+n)
+S_top = S[:, :m]
+S_bottom = S[:, m:]
+SA_top = S_top @ A
+
+A_sketch = SA_top + damp * S_bottom
+R = qr(A_sketch).R
+```
+
 ## 驗證方式與預期輸出
 
 - **Per-damp solver comparison** 表格會列出：
   - `iters`、`build_s`、`solve_s`
   - `||Ax-b||`、`||grad||=||Aᵀ(Ax-b)+damp²x||`、`||x||`
-- **k-fold CV** 會對每個 preconditioner 印出：
+- **k-fold CV（baseline）** 會對每個 preconditioner 印出：
   - damp vs train/val RMSE（mean±std）
   - `iters(mean)`（成本 proxy）
   - `Total curve cost`（整條曲線的 build/solve/iters 總成本）
-
+- **CV sweep speedups** 會額外印出：
+  - baseline vs speedups 的總時間/總迭代數/最佳 val RMSE 對照表
+  - rand-QR 的 `shared-sketch` vs `fixed-R`（兩者都搭配 warm-start）的摘要行
