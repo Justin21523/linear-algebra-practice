@@ -7,6 +7,8 @@
 - 實作檔案：
   - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/lsmr_damped_sparse_matrix_free_numpy.py`
   - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/lsmr_damped_sparse_operator_only_numpy.py`
+  - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/matrix_free_dataset_io_numpy.py`
+  - `04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python/lsmr_damped_sparse_dataset_io_demo_numpy.py`
 - 文件路徑：`docs/implementations/04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/README.md`
 
 ## 目標與背景
@@ -32,6 +34,20 @@ python3 lsmr_damped_sparse_matrix_free_numpy.py
 ```bash
 cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
 python3 lsmr_damped_sparse_operator_only_numpy.py
+```
+
+新增：跑「從檔案/串流讀資料」的 dataset I/O demo（自動產生小型資料並用多種格式跑 CV）
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_dataset_io_demo_numpy.py --generate_sample --task regression
+```
+
+二元分類版本（labels 會被處理成 `{-1,+1}`，並額外報告 accuracy）：
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_dataset_io_demo_numpy.py --generate_sample --task binary_classification
 ```
 
 ## 核心做法（重點步驟）
@@ -88,6 +104,40 @@ CSR（Compressed Sparse Row）用三個陣列描述稀疏矩陣：
 
 - 你用時間換記憶體：每次 matvec/rmatvec 都要重新生成 row 的非零結構
 - 這更貼近「資料量超大、但單筆 row 很稀疏」的 pipeline（也更貼近 matrix-free 的精神）
+
+### 再進一步：從檔案/串流讀資料（Dataset I/O backends）
+
+前兩個版本（CSR / operator-only）都在「程式內」直接擁有資料來源：
+
+- CSR：`A` 以 CSR 三陣列常駐記憶體（但 solver 仍是 matrix-free）
+- operator-only：`A` 根本不存，用 deterministic hashing 即時生成 row
+
+真實的 ML/數值線代管線常見第三種情境：**資料在檔案/資料湖/串流**，你希望做到：
+
+- 不需要把 `A` 全部轉成 dense
+- CV 時不複製 `A_tr/A_va` 的任何矩陣資料（只用 row index）
+- 仍可支援 preconditioning（至少 col-scaling，最好也能做 sparse rand-QR/CountSketch）
+- 仍可支援 sample weights（WLS）與 feature hashing（尤其 one-hot / 高維稀疏特徵）
+
+本單元新增 `matrix_free_dataset_io_numpy.py` 來提供「同一個 solver pipeline 可重用」的介面：
+
+- 每個 backend 都能 build `RowSubsetOperator`，提供：
+  - `matvec` / `rmatvec`：對應 **加權後** 的 `A_w = diag(sqrt(w)) A`
+  - `b_scaled`：`b_w = sqrt(w) b`
+  - `col_norms_sq_and_fro_sq_weighted()`：給 col-scaling 與 stopping criteria 用
+  - `build_countsketch_aug_weighted()`：給 rand-QR（CountSketch）用
+
+支援的資料格式（目標情境）：
+
+- `LibSVM`（稀疏 row-based，支援 `label [weight] idx:val ...` 與 feature hashing）
+- `COO`（稀疏 triples streaming：`row col val`，targets/weights 另外用 `.npy`）
+- `NPZ (CSR)`（`data/indices/indptr/shape/b/weights`）
+- `CSV`（dense，示範用：直接 load 進記憶體）
+- `NumPy memmap (.npy)`（dense，`np.load(..., mmap_mode='r')`，較貼近大資料）
+
+> 注意：真正的「逐次從檔案掃」在每次迭代都會很慢；所以這裡的重點是：**介面與成本概念**要先建立起來。  
+> 若你要更貼近大規模，通常會用：memmap/NPZ、或 matrix-free 的 row generator（operator-only）、或乾脆直接用 matrix-free 的線性算子（不落地 A）。
+
 
 ### Ridge 的驗收量（為什麼看 `‖Aᵀr + damp²x‖`）
 
@@ -229,6 +279,18 @@ b_top    = b - A @ x0
 b_bottom = -damp * x0
 delta    = solver(A, b_top, b_bottom)
 x_hat    = x0 + delta
+```
+
+> Dataset I/O 版本的「加權最小平方」（WLS）：把 weights 變成 row scaling，讓 solver 完全不用改。
+
+```text
+A_w = diag(sqrt(w)) A
+b_w = sqrt(w) b
+
+matvec_Aw(x)   = sqrt(w) * (A @ x)
+rmatvec_Aw(y)  = A^T @ (sqrt(w) * y)
+
+weighted_RMSE = ||A_w x - b_w|| / sqrt(sum(w))
 ```
 
 > CountSketch rand-QR（sparse 版）的核心更新：先建 `SA_top = S_top A`，每個 `damp` 只補上 identity 部分再 QR 取 `R`。

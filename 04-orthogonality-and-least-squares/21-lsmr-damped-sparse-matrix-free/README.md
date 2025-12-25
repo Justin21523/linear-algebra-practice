@@ -15,7 +15,9 @@
 ```
 python/
 ├── lsmr_damped_sparse_matrix_free_numpy.py         # CSR matvec + damped LSMR (teaching) + (none/col/rand-QR) + k-fold CV + curve cost + warm-start
-└── lsmr_damped_sparse_operator_only_numpy.py       # Operator-only sparse A (no CSR stored) + same CV/cost pipeline (more "true matrix-free")
+├── lsmr_damped_sparse_operator_only_numpy.py       # Operator-only sparse A (no CSR stored) + same CV/cost pipeline (more "true matrix-free")
+├── matrix_free_dataset_io_numpy.py                 # File/stream-backed matrix-free dataset backends (libsvm/coo/csr_npz/csv/memmap) + weights + feature hashing
+└── lsmr_damped_sparse_dataset_io_demo_numpy.py     # Demo: k-fold CV + damped LSMR on file-backed datasets (regression / binary classification)
 ```
 
 ## 如何執行
@@ -32,6 +34,20 @@ python3 lsmr_damped_sparse_matrix_free_numpy.py
 ```bash
 cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
 python3 lsmr_damped_sparse_operator_only_numpy.py
+```
+
+新增：跑「從檔案/串流讀資料」的 dataset I/O demo（會自動產生一份小型資料集，並用多種格式各跑一次）：
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_dataset_io_demo_numpy.py --generate_sample --task regression
+```
+
+（二元分類版本：labels 會被處理成 `{-1,+1}`，並額外報告 accuracy）
+
+```bash
+cd 04-orthogonality-and-least-squares/21-lsmr-damped-sparse-matrix-free/python
+python3 lsmr_damped_sparse_dataset_io_demo_numpy.py --generate_sample --task binary_classification
 ```
 
 ## 你應該會看到什麼？
