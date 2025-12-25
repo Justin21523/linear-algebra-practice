@@ -140,6 +140,27 @@ def k_fold_splits(  # EN: Build deterministic k-fold splits (train_idx, val_idx)
     return splits  # EN: Return splits list.
 
 
+def k_fold_assignments(  # EN: Build a per-sample fold-id assignment without storing all train_idx arrays.
+    rng: np.random.Generator,  # EN: RNG for shuffling.
+    n_samples: int,  # EN: Total sample count.
+    n_folds: int,  # EN: Number of folds.
+) -> np.ndarray:  # EN: Return fold_ids where fold_ids[i] in {0..n_folds-1}.
+    if n_folds < 2:  # EN: Require at least 2 folds.
+        raise ValueError("n_folds must be >= 2")  # EN: Reject invalid fold count.
+    if n_samples < n_folds:  # EN: Ensure each fold can be non-empty.
+        raise ValueError("n_samples must be >= n_folds")  # EN: Reject impossible split.
+
+    # EN: Pick a compact dtype for fold ids (int8 is enough for typical k-fold values like 5 or 10).  # EN: Explain dtype choice.
+    fold_dtype = np.int8 if int(n_folds) <= int(np.iinfo(np.int8).max) else np.int16  # EN: Choose minimal safe dtype.
+
+    # EN: Create a balanced label list (each fold appears equally often, up to ±1), then shuffle in-place.  # EN: Explain construction.
+    base = np.arange(int(n_folds), dtype=fold_dtype)  # EN: Base fold labels [0,1,...,k-1].
+    reps = int((int(n_samples) + int(n_folds) - 1) // int(n_folds))  # EN: Ceiling(n_samples / n_folds).
+    fold_ids = np.tile(base, reps)[: int(n_samples)].astype(fold_dtype)  # EN: Repeat labels and trim to length n_samples.
+    rng.shuffle(fold_ids)  # EN: Shuffle fold assignments deterministically.
+    return fold_ids  # EN: Return fold-id assignment array.
+
+
 def generate_random_sparse_csr(  # EN: Generate a random sparse matrix with fixed nnz per row (CSR).
     rng: np.random.Generator,  # EN: RNG for reproducibility.
     m: int,  # EN: Number of rows.
@@ -866,7 +887,8 @@ def choose_fixed_randqr_reference_damp(damps_sorted: np.ndarray) -> float:  # EN
 
 
 def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse CSR matrix, accumulating total cost.
-    splits: list[tuple[np.ndarray, np.ndarray]],  # EN: CV splits (train_idx, val_idx).
+    fold_ids: np.ndarray,  # EN: Per-sample fold assignment array (length m_full).
+    n_folds: int,  # EN: Number of folds (k).
     A_full: CSRMatrix,  # EN: Full sparse design matrix (rows will be selected per fold).
     b_full: np.ndarray,  # EN: Full targets vector (length m_full).
     damps: np.ndarray,  # EN: Damp grid to sweep (will be sorted ascending for reporting).
@@ -881,17 +903,27 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
 ) -> tuple[list[CVPoint], CVTotals, CVPoint]:  # EN: Return (points, totals, best_point).
     damps_sorted = np.array(sorted([float(d) for d in damps]), dtype=float)  # EN: Sort damps ascending for reporting.
     n_damps = int(damps_sorted.size)  # EN: Number of damp values.
-    n_folds = int(len(splits))  # EN: Number of folds.
-    n_features = int(A_full.shape[1])  # EN: Feature count.
+    n_folds_i = int(n_folds)  # EN: Normalize fold count to int.
+    if n_folds_i < 2:  # EN: Require at least 2 folds.
+        raise ValueError("n_folds must be >= 2")  # EN: Reject invalid k.
+    m_full, n_features = A_full.shape  # EN: Extract full dimensions.
+    m_full_i = int(m_full)  # EN: Normalize m_full to int.
+    n_features = int(n_features)  # EN: Normalize n_features to int.
+
+    fold_ids_1d = np.asarray(fold_ids, dtype=int).reshape(-1)  # EN: Normalize fold_ids to a 1D int array.
+    if fold_ids_1d.size != m_full_i:  # EN: Validate fold_ids length.
+        raise ValueError("fold_ids must have length m_full")  # EN: Reject mismatched folds vector.
+    if np.any(fold_ids_1d < 0) or np.any(fold_ids_1d >= n_folds_i):  # EN: Validate fold id range.
+        raise ValueError("fold_ids entries must be in [0, n_folds)")  # EN: Reject invalid fold assignments.
 
     order = np.arange(n_damps, dtype=int)  # EN: Default evaluation order is ascending.
     if warm_start:  # EN: For continuation, starting from large damp is often more stable (solution near 0).
         order = order[::-1]  # EN: Evaluate from largest damp down to smallest.
 
-    train_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store train RMSE per (damp, fold).
-    val_rmse_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store val RMSE per (damp, fold).
-    xnorm_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store ||x|| per (damp, fold).
-    iters_mat = np.zeros((n_damps, n_folds), dtype=float)  # EN: Store iterations per (damp, fold).
+    train_rmse_mat = np.zeros((n_damps, n_folds_i), dtype=float)  # EN: Store train RMSE per (damp, fold).
+    val_rmse_mat = np.zeros((n_damps, n_folds_i), dtype=float)  # EN: Store val RMSE per (damp, fold).
+    xnorm_mat = np.zeros((n_damps, n_folds_i), dtype=float)  # EN: Store ||x|| per (damp, fold).
+    iters_mat = np.zeros((n_damps, n_folds_i), dtype=float)  # EN: Store iterations per (damp, fold).
 
     total_build = 0.0  # EN: Accumulate preconditioner build time across all fits.
     total_solve = 0.0  # EN: Accumulate solver time across all fits.
@@ -911,8 +943,12 @@ def cv_sweep_curve_sparse(  # EN: Sweep a damp grid with k-fold CV for a sparse 
     damp_ref = choose_fixed_randqr_reference_damp(damps_sorted)  # EN: Reference damp for fixed-R policy.
 
     b_full_1d = np.asarray(b_full, dtype=float).reshape(-1)  # EN: Normalize b_full to a 1D float array once.
+    if b_full_1d.size != m_full_i:  # EN: Validate b_full length.
+        raise ValueError("b_full must have length m_full")  # EN: Reject invalid b length.
 
-    for fold_id, (train_idx, val_idx) in enumerate(splits):  # EN: Loop folds (outer) to enable continuation within each fold.
+    for fold_id in range(n_folds_i):  # EN: Loop folds (outer) to enable continuation within each fold.
+        val_idx = np.nonzero(fold_ids_1d == int(fold_id))[0]  # EN: Validation row indices for this fold.
+        train_idx = np.nonzero(fold_ids_1d != int(fold_id))[0]  # EN: Training row indices for this fold.
         # EN: IMPORTANT: do NOT build A_tr/A_va as new CSR matrices; instead, keep A_full and use row-index operators.  # EN: Explain memory goal.
         subset_tr = make_csr_row_subset(A=A_full, row_ids=train_idx, cache_pointers=False)  # EN: Training operator view A_full[train_idx, :] (no pointer cache to save memory).
         subset_va = make_csr_row_subset(A=A_full, row_ids=val_idx, cache_pointers=False)  # EN: Validation operator view A_full[val_idx, :] (no pointer cache to save memory).
@@ -1158,10 +1194,10 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
             )  # EN: End append.
     print_solver_table(reports)  # EN: Print table.
 
-    # EN: Build CV splits once so baseline/speedups compare on the same folds.  # EN: Explain split policy.
+    # EN: Build a fold assignment once so baseline/speedups compare on the same folds without storing k train_idx arrays.  # EN: Explain memory goal.
     n_folds = 5  # EN: Number of folds for k-fold CV.
-    rng_split = np.random.default_rng(SEED + 20)  # EN: Dedicated RNG for deterministic splits.
-    splits = k_fold_splits(rng=rng_split, n_samples=m, n_folds=n_folds)  # EN: Build k-fold splits.
+    rng_split = np.random.default_rng(SEED + 20)  # EN: Dedicated RNG for deterministic fold assignments.
+    fold_ids = k_fold_assignments(rng=rng_split, n_samples=m, n_folds=n_folds)  # EN: Build per-sample fold ids (length m).
 
     # EN: Damp grid for CV (include 0 plus a log-grid).  # EN: Explain hyperparameter grid.
     damps = np.concatenate(([0.0], np.logspace(-6, 1, num=12)))  # EN: Candidate damps for CV.
@@ -1173,7 +1209,8 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
 
     for pk in preconds:  # EN: Run baseline CV for each preconditioner.
         points, totals, best = cv_sweep_curve_sparse(  # EN: Run one full CV curve sweep.
-            splits=splits,  # EN: Provide splits.
+            fold_ids=fold_ids,  # EN: Provide fold assignment.
+            n_folds=n_folds,  # EN: Provide fold count.
             A_full=A,  # EN: Provide full A.
             b_full=b,  # EN: Provide full b.
             damps=damps,  # EN: Provide damp grid.
@@ -1214,7 +1251,8 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
     for pk in preconds:  # EN: Run speedup CV for each preconditioner.
         policy = "shared_sketch" if pk == "randqr" else "rebuild"  # EN: Only rand-QR uses special reuse; others ignore policy.
         points, totals, best = cv_sweep_curve_sparse(  # EN: Run CV sweep with speedups enabled.
-            splits=splits,  # EN: Provide splits.
+            fold_ids=fold_ids,  # EN: Provide fold assignment.
+            n_folds=n_folds,  # EN: Provide fold count.
             A_full=A,  # EN: Provide full A.
             b_full=b,  # EN: Provide full b.
             damps=damps,  # EN: Provide damp grid.
@@ -1256,7 +1294,8 @@ def main() -> None:  # EN: Run a sparse matrix-free ridge demo with precondition
     print_separator("rand-QR reuse variants (warm-start): shared-sketch vs fixed-R")  # EN: Announce extra experiment.
     rng_cv_fixed = np.random.default_rng(SEED + 50)  # EN: Separate RNG for fixed-R variant.
     _points_fixed, totals_fixed, best_fixed = cv_sweep_curve_sparse(  # EN: Run fixed-R variant.
-        splits=splits,  # EN: Provide splits.
+        fold_ids=fold_ids,  # EN: Provide fold assignment.
+        n_folds=n_folds,  # EN: Provide fold count.
         A_full=A,  # EN: Provide full A.
         b_full=b,  # EN: Provide full b.
         damps=damps,  # EN: Provide damp grid.

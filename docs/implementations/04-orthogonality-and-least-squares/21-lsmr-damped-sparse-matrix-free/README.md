@@ -108,6 +108,8 @@ CV 的品質部分，則是用：
 - `train_rmse(mean±std)`：訓練集 RMSE（跨 folds 的平均與標準差）
 - `val_rmse(mean±std)`：驗證集 RMSE（跨 folds 的平均與標準差）
 
+另外，本單元為了讓 `m` 很大時不要一次存下所有 folds 的 `train_idx`（那會變成 O(k·m) 的索引記憶體），改用「每個樣本一個 fold id」的 `fold_ids` 表示法：需要 fold 時才用 `fold_ids==i` 取出該 fold 的 indices。
+
 ### CV fold 不複製 CSR：row-index 的 matrix-free operator
 
 這一版的單元 21 刻意避免在每個 fold 建 `A_tr/A_va` 的 CSR 子矩陣（那會複製 `data/indices/indptr`，在超大 `m` 時非常花記憶體與建表時間）。
